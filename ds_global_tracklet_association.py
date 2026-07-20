@@ -26,7 +26,7 @@ if path_to_botsort_parent not in sys.path:
     sys.path.append(path_to_botsort_parent)
 
 from botsort.bot_sort import BoTSORT
-from botsort.global_registry import GlobalRegistry
+from botsort.global_tracklet_association import GTA
 from botsort.multi_camera_tracker import MultiCameraTracker
 from evaluate_tracking import EvaluateTracking
 
@@ -88,10 +88,10 @@ def save_global_id_crop(output_dir, global_id, frame_bgr, bbox_tlwh, frame_id, t
     cv2.imwrite(out_path, crop)
 
 
-registry = GlobalRegistry(
-    reid_log_path="./reid_norm_log.jsonl",
-    match_threshold=0.5,
-    min_frames=30,
+gta = GTA(
+    reid_log_path="./gta_log.jsonl",
+    window_frames=600,
+    min_tracklet_len=30,
 )
 
 tracker1 = BoTSORT(
@@ -110,7 +110,7 @@ tracker1 = BoTSORT(
     max_batch_size=8,
     map_len=None,
     real_data=True,
-    registry=registry,
+    registry=gta,
     # frame_width=1920,
     # frame_height=1080,
 )
@@ -130,12 +130,12 @@ tracker2 = BoTSORT(
     max_batch_size=8,
     map_len=None,
     real_data=True,
-    registry=registry,
+    registry=gta,
     # frame_width=1920,
     # frame_height=1080,
 )
 
-mct = MultiCameraTracker(registry=registry)
+mct = MultiCameraTracker(registry=gta)
 mct.add_camera(0, tracker1)
 mct.add_camera(1, tracker2)
 
@@ -315,9 +315,11 @@ def reid_pad_buffer_probe(pad, info, u_data):
 
     with nvtx.annotate("tracker_update", color="red"):
         # update_batch() runs BoTSORT.update() for both cameras (once each,
-        # for this whole batch tick) and then registry.step() for each -
-        # this single shared GlobalRegistry is what makes cross-camera
-        # re-identification (GTA) happen, see botsort/multi_camera_tracker.py.
+        # for this whole batch tick) and then gta.step() for each - this single
+        # shared GTA instance is what makes cross-camera Global Tracklet
+        # Association happen, see botsort/multi_camera_tracker.py. Identity is
+        # only ever decided once per gta.window_frames tick, from a tracklet's
+        # whole first->last visible span, not off this single call.
         # Both sources land in the same nvstreammux batch each tick here, so
         # one frame_num (from whichever source_id has a frame_meta this
         # batch) is representative for both.
@@ -345,9 +347,10 @@ def reid_pad_buffer_probe(pad, info, u_data):
                     cam_source, frame_meta.frame_num, t.track_id, t.t_global_id, bbox_native
                 )
 
-    # ── Gallery snapshots: save a crop whenever EITHER camera's registry
-    # step just assigned a global_id this tick (new identity or re-id
-    # match) - mct.last_assigned[source_id] holds exactly those tracks (see
+    # ── Gallery snapshots: save a crop whenever EITHER camera's gta.step()
+    # call just resolved a tracklet's identity (a GTA tick converged it into a
+    # new or existing IdentityCluster) - mct.last_assigned[source_id] holds
+    # exactly those tracks (see
     # MultiCameraTracker.update_camera). Pull each source's own RGBA buffer
     # only when that source actually has something to save this tick.
     nvtx.push_range("gallery_snapshot", color="magenta")
@@ -399,9 +402,20 @@ def reid_pad_buffer_probe(pad, info, u_data):
             # same id regardless of which camera/tile you're looking at -
             # for monitoring, that's what makes a match visually obvious.
             gid_label = str(t.t_global_id) if t.t_global_id > 0 else "?"
+            # Identity age: how long ago the GTA tick that resolved this
+            # tracklet's identity ran, read straight off the STrack
+            # (t_identity_since_frame, set by GTA - see botsort/bot_sort.py and
+            # botsort/global_tracklet_association.py) so no second call into GTA
+            # is needed just to render this label.
+            age_label = ""
+            if t.t_global_id > 0 and t.t_identity_since_frame > 0:
+                age_s = max(0, frame_meta.frame_num - t.t_identity_since_frame) / 30.0
+                age_label = f" | {age_s:.0f}s"
 
             text_params = display_meta.text_params[slot]
-            text_params.display_text = f"g{gid_label} | t{t.track_id} | {'o' if t.is_touching_edge else 'i'}"
+            text_params.display_text = (
+                f"g{gid_label} | t{t.track_id} | {'o' if t.is_touching_edge else 'i'}{age_label}"
+            )
             text_params.x_offset = max(0, int(t.tlwh[0]))
             text_params.y_offset = max(0, int(t.tlwh[1]))
             text_params.font_params.font_name = "Serif"

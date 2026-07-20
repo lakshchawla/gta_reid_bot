@@ -1,0 +1,16 @@
+model,embed_dim,batch_size,mean_latency_ms,latency_per_item_ms,throughput_qps
+256d (production: resnet50_market1501_aicity156),256,1,0.8712,0.8712,1144.96
+256d (production: resnet50_market1501_aicity156),256,8,1.95438,0.2442975,510.856
+256d (production: resnet50_market1501_aicity156),256,16,3.47065,0.216915625,287.641
+256d (production: resnet50_market1501_aicity156),256,32,7.54267,0.2357084375,132.221
+256d (production: resnet50_market1501_aicity156),256,50,12.1571,0.243142,81.921
+1024d (synthetic projection head),1024,1,0.891364,0.891364,1119.14
+1024d (synthetic projection head),1024,8,2.00151,0.25018875,498.809
+1024d (synthetic projection head),1024,16,3.53875,0.221171875,282.103
+1024d (synthetic projection head),1024,32,7.56038,0.236261875,131.874
+1024d (synthetic projection head),1024,50,12.2315,0.24463000000000001,81.4257
+"2048d (full resnet50_market1501, no head)",2048,1,0.857233,0.857233,1163.51
+"2048d (full resnet50_market1501, no head)",2048,8,1.94228,0.242785,514.029
+"2048d (full resnet50_market1501, no head)",2048,16,3.48125,0.217578125,286.79
+"2048d (full resnet50_market1501, no head)",2048,32,7.50379,0.2344934375,132.903
+"2048d (full resnet50_market1501, no head)",2048,50,12.2036,0.24407199999999998,81.603

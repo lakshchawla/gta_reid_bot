@@ -45,6 +45,11 @@ class STrack(BaseTrack):
         self.centroid = np.asarray(self._tlwh[:2] + self._tlwh[2:] / 2, dtype=np.float64)
         self.t_global_id = 0
         self.global_id = 0
+        # DS shared frame_id at which the current t_global_id was resolved - set
+        # by GTA (botsort/global_tracklet_association.py), unused by GlobalRegistry.
+        # Lets a display probe show "how long has this identity been resolved"
+        # straight off the STrack, with no second call into the registry.
+        self.t_identity_since_frame = 0
 
         # adding object meta for global_id_assignment
         self.curr_obj_meta_ref = obj_meta

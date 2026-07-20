@@ -1,3 +1,19 @@
+"""
+Single-camera ReID gallery for BoT-SORT.
+
+BoT-SORT already resolves frame-to-frame association on its own (it owns
+track_id continuity). This module's only job is: once a tracklet has been
+alive long enough to be trusted (`min_frames`), decide whether it belongs to
+a person we've already met before (hand back their old global_id) or a
+genuinely new person (mint a new one). That decision is made purely from
+appearance, against a FAISS gallery of mean ReID embeddings - no IOU, no
+motion. There's nothing camera-specific in this file at all: `query()`/
+`step()` operate on whichever BoT-SORT instance is handed to them, so
+multi-camera Global Tracklet Association (see botsort/multi_camera_tracker.py)
+is just calling `step()` once per camera against one shared `GlobalRegistry` -
+no separate multi-camera code path lives here.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -16,12 +32,33 @@ from sklearn.cluster import DBSCAN
 
 from . import matching
 
+# query() decision statuses. MATCH commits immediately; AMBIGUOUS means the
+# top-1 hit cleared the distance bar but the top-2 margin is too thin to
+# decide safely (the lookalike-collision case) - the tracklet goes to the
+# pending pool and is arbitrated by the interval Hungarian solver instead
+# of being minted a (possibly wrong, irreversible) new global_id on the
+# spot. NO_MATCH means nothing in the gallery is close enough.
 MATCH = "match"
 AMBIGUOUS = "ambiguous"
 NO_MATCH = "no_match"
 
 
 def cosine_similarity(unit_a: np.ndarray, unit_b: np.ndarray, transform: Optional[np.ndarray] = None) -> float:
+    """Similarity between two already-unit-normalized embeddings.
+
+    Assumes both inputs are unit vectors - this is a drop-in for a plain dot
+    product, not a general-purpose similarity (no internal renormalization).
+
+    `transform`, if given, is a placeholder for a future learned
+    cross-camera correction matrix M (`unit_a @ M @ unit_b`) - e.g. to
+    correct for systematic appearance drift between two cameras' lighting/
+    lens/color calibration. Not used anywhere yet (transform=None everywhere
+    today), but kept here so that work has a single, obvious integration
+    point. Note this would need to be applied to the query vector before a
+    FAISS search (`query() @ M`), not inside FAISS itself - FAISS only
+    computes plain inner products against the indexed (untransformed)
+    gallery rows.
+    """
     if transform is None:
         return float(np.dot(unit_a, unit_b))
     return float(unit_a @ transform @ unit_b)
@@ -68,19 +105,38 @@ class SpatioTemporalPrior:
 
 @dataclass
 class PendingTracklet:
+    """A tracklet whose identity decision was deferred (AMBIGUOUS query, or
+    its best match is currently claimed by a live track). Accumulates
+    evidence per frame until the interval solver arbitrates the whole pool
+    jointly - or until a later frame's margin test becomes confident, in
+    which case it commits immediately and leaves the pool."""
     tid: int
     cam_source: object
-    track_ref: object                 # STrack reference 
+    track_ref: object                 # the STrack, so the solver can still set t_global_id
     first_frame: int
     last_frame: int
-    feat: np.ndarray                  # smooth_feat 
-    bbox: np.ndarray = None           # tlwh - check taking from strack 
+    feat: np.ndarray                  # latest smooth_feat copy
+    bbox: np.ndarray = None           # latest tlwh copy (for _register/add_embedding)
     cannot_link_gids: set = field(default_factory=set)
     hits: int = 1
+    # Set by deactivate_track() when BoT-SORT permanently removes the track
+    # before the solver runs: the solve still resolves its identity (the
+    # evidence stays valid) but must not leave a live active_tid claim.
     dead: bool = False
 
 
 class GalleryEntry:
+    """One real-world identity living in the gallery.
+
+    Appearance is summarized as a single EMA-updated centroid rather than a
+    windowed mean over raw embeddings - O(1) per update instead of O(window),
+    and paired with an outlier-rejection gate (see
+    GlobalRegistry.outlier_reject_thresh) so a confidently-wrong observation
+    (occlusion, motion blur, a brief mis-association) is dropped before it
+    ever touches the centroid, instead of every historical embedding - good
+    or corrupted - permanently sharing equal weight in a mean.
+    """
+
     def __init__(self, global_id: int, feat: np.ndarray, frame_id: int, bbox: np.ndarray, ema_alpha: float = 0.9, cam_source=None):
         self.global_id = global_id
         self.active_tid: Optional[int] = None
@@ -90,11 +146,34 @@ class GalleryEntry:
 
         self.centroid = feat.copy()
         self.update_count = 1
+        # Logging-only: which camera (BoTSORT.cam_source) last claimed this
+        # identity. Never read by query()/matching - GlobalRegistry stays
+        # fully camera-agnostic, this exists purely so step() can report
+        # whether a re-id match crossed cameras or not.
         self.last_cam_source = cam_source
+        # Consecutive rejected (confidently-inconsistent) observations for
+        # whoever currently holds active_tid. Used by GlobalRegistry.step()
+        # to detect "this track_id's underlying identity got silently
+        # swapped by BoT-SORT's own IOU-based association" (e.g. an
+        # occlusion/crossing-paths mis-continuation) and revoke the
+        # global_id rather than trust it forever. Resets whenever a
+        # consistent observation comes back in, or active_tid changes.
         self.mismatch_streak = 0
 
     def add_embedding(self, feat: np.ndarray, frame_id: int, bbox: np.ndarray,
                       outlier_reject_thresh: float = 1.0, occlusion_score: float = 0.0) -> bool:
+        """Returns True if the observation was consistent enough to blend
+        into the centroid, False if it was rejected as an outlier.
+
+        occlusion_score (0.0–1.0): how much the track overlaps with a peer
+        track this frame. When > 0, the new observation's contribution to
+        the centroid is scaled down proportionally — effective_alpha → 1.0
+        (freeze) as occlusion_score → 1.0 — so overlap-contaminated
+        embeddings drift the centroid less.
+        """
+        # Always record that the identity was seen this frame, even if the
+        # observation itself gets rejected below - it shouldn't look stale
+        # just because of a few corrupted frames in a row.
         self.last_frame = frame_id
         self.last_bbox = bbox.copy()
 
@@ -122,19 +201,63 @@ class GalleryEntry:
 
 
 class GlobalRegistry:
+    """
+    FAISS-backed appearance gallery, single camera only.
+
+    match_threshold : cosine-distance ceiling to accept a re-ID match.
+                       Lower = stricter (fewer false re-identifications, but
+                       more new IDs minted for people seen before).
+    min_frames      : a tracklet must survive this many frames before its
+                       embedding is trusted enough to query/register with.
+    min_margin      : required cosine-distance gap between the best and
+                       second-best gallery hit. Guards against an ambiguous
+                       gallery (two similar-looking identities) - if the
+                       runner-up is nearly as close as the winner, treat the
+                       query as unresolved rather than risk merging two
+                       different people.
+    ema_alpha       : weight given to an identity's existing centroid (vs.
+                       the new observation) on each accepted update. Higher
+                       = slower-drifting, more stable identity.
+    outlier_reject_thresh : cosine-distance floor above which a new
+                       observation is treated as confidently inconsistent
+                       with an identity's established appearance and
+                       dropped instead of blended into the centroid. Must
+                       stay looser than match_threshold - same "confidently
+                       right" vs "confidently wrong" split used for the
+                       appearance veto in bot_sort.py. Defaults to
+                       match_threshold + 0.3 if not given.
+    identity_revoke_streak : once a track already carries a global_id,
+                       step() trusts it and just refreshes the centroid -
+                       it never re-verifies the identity. If BoT-SORT's own
+                       IOU-based association silently hands that track_id
+                       to a *different* person underneath it (e.g. an
+                       occlusion/crossing-paths mis-continuation - a person
+                       with very different appearance ends up carrying
+                       someone else's track_id and therefore their
+                       global_id), outlier_reject_thresh only protects the
+                       centroid from corruption, it does nothing to correct
+                       the now-wrong identity label. After this many
+                       *consecutive* rejected observations for the same
+                       track, conclude the underlying identity has likely
+                       been swapped: revoke the global_id so the track
+                       falls back through eligibility and gets freshly
+                       re-queried/re-registered against its real, current
+                       appearance.
+    """
+
     def __init__(
         self,
         match_threshold: float = 0.35,
         min_frames: int = 5,
-        emb_dim: int = 256,
+        emb_dim: Optional[int] = None,
         use_gpu: bool = True,
         min_margin: float = 0.05,
         ema_alpha: float = 0.9,
-        outlier_reject_thresh: Optional[float] = 0.3,
+        outlier_reject_thresh: Optional[float] = 0.150,
         identity_revoke_streak: int = 5,
         overlap_freeze_thresh: float = 0.3,
         overlap_cooldown_frames: int = 10,
-        confusion_eps: float = 0.17,
+        confusion_eps: float = 0.15,
         confusion_refresh_interval: int = 100,
         merge_threshold: float = 0.2,
         reid_log_path: Optional[str] = None,
@@ -148,6 +271,12 @@ class GlobalRegistry:
     ):
         self.match_threshold = match_threshold
         self.min_frames = min_frames
+        # emb_dim=None (default): inferred from the first embedding this
+        # registry ever sees (_ensure_index), so swapping the ReID model's
+        # output size (256/1024/2048/...) never requires updating a literal
+        # here. If given explicitly, that dimension is enforced from the
+        # start - a mismatched embedding raises immediately with a clear
+        # message instead of a bare `assert d == self.d` deep inside FAISS.
         self.emb_dim = emb_dim
         self.min_margin = min_margin
         self.ema_alpha = ema_alpha
@@ -233,18 +362,45 @@ class GlobalRegistry:
         self._gid_to_entry: dict[int, GalleryEntry] = {}
         self._tid_to_gid: dict[int, int] = {}
 
-        cpu_index = faiss.IndexFlatIP(emb_dim)
-        self._index = cpu_index
-        if use_gpu:
-            try:
-                res = faiss.StandardGpuResources()
-                self._index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
-            except Exception as exc:
-                print(f"[REGISTRY] GPU FAISS unavailable ({exc}); using CPU index")
+        # Built lazily by _ensure_index() once the actual embedding
+        # dimension is known (either passed explicitly above, or inferred
+        # from the first registered feature), rather than fixed here -
+        # see the emb_dim comment above.
+        self._use_gpu = use_gpu
+        self._index: Optional[faiss.Index] = None
+        if emb_dim is not None:
+            self._ensure_index(emb_dim)
 
         self._index_gids: list[int] = []  # row i in self._index -> global_id
 
     # --- gallery search ------------------------------------------------
+
+    def _ensure_index(self, dim: int):
+        """Build the FAISS index on first use, sized to whatever embedding
+        dimension actually shows up. Every later call just validates that
+        dimension hasn't silently changed underneath us (e.g. the ReID
+        model was swapped mid-run) - raising a clear error here instead of
+        letting a bare `assert d == self.d` surface from inside FAISS."""
+        if self._index is None:
+            self.emb_dim = dim
+            cpu_index = faiss.IndexFlatIP(dim)
+            self._index = cpu_index
+            if self._use_gpu:
+                try:
+                    res = faiss.StandardGpuResources()
+                    self._index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
+                except Exception as exc:
+                    print(f"[REGISTRY] GPU FAISS unavailable ({exc}); using CPU index")
+            print(f"[REGISTRY] FAISS index initialized for emb_dim={dim}")
+        elif dim != self.emb_dim:
+            raise ValueError(
+                f"GlobalRegistry received a {dim}-d embedding but its FAISS "
+                f"index was already built for emb_dim={self.emb_dim}. The "
+                f"ReID model's output size must not change once the "
+                f"registry has started (mixing embedding sizes in one "
+                f"gallery is meaningless anyway - the vectors aren't "
+                f"comparable). Restart the pipeline after swapping models."
+            )
 
     def query(self, feat: np.ndarray) -> tuple[str, Optional[GalleryEntry], float, float]:
         """Margin test on raw cosine over the FAISS top-2.
@@ -263,7 +419,7 @@ class GlobalRegistry:
         multi-prototype rows are ever added, the runner-up scan must skip
         rows sharing the top-1's gid before applying the margin.
         """
-        if feat is None or self._index.ntotal == 0:
+        if feat is None or self._index is None or self._index.ntotal == 0:
             return NO_MATCH, None, 1.0, 1.0
 
         n = np.linalg.norm(feat)
@@ -315,7 +471,7 @@ class GlobalRegistry:
         person merge (the feedback loop where splits keep minting new IDs
         that grow the confusion zone, making the next split's margin even
         tighter)."""
-        if feat is None or self._index.ntotal == 0:
+        if feat is None or self._index is None or self._index.ntotal == 0:
             return None, 1.0
         n = np.linalg.norm(feat)
         if n < 1e-9:
@@ -332,6 +488,7 @@ class GlobalRegistry:
     # --- gallery mutation ------------------------------------------------
 
     def _register(self, feat: np.ndarray, frame_id: int, bbox: np.ndarray, cam_source=None) -> int:
+        self._ensure_index(feat.shape[-1])
         gid = self._next_gid
         self._next_gid += 1
         self._gid_to_entry[gid] = GalleryEntry(gid, feat, frame_id, bbox, ema_alpha=self.ema_alpha, cam_source=cam_source)
@@ -517,20 +674,46 @@ class GlobalRegistry:
         self._pending.clear()
         self._rebuild_index()
 
+    # --- per-frame driver ------------------------------------------------
 
     def step(self, tracker, frame_id: int) -> list:
+        """Run once per frame against a single BoTSORT instance.
+
+        Returns the tracks that were just tied to a global_id during this
+        call - either a fresh registration or a re-id match. Tracks that
+        already had a global_id coming in (the common case, every frame)
+        are not included. Useful for callers that want to react exactly
+        once per identity-assignment event, e.g. saving a gallery snapshot.
+        """
         index_dirty = False
         assigned_this_step: list = []
         cam_source = getattr(tracker, "cam_source", None)
 
         self._refresh_confusion_zones(frame_id)
+        # Arbitrate any deferred (ambiguous) tracklets once per interval.
+        # Runs before this frame's decisions so freshly-freed identities
+        # are visible to the per-track loop below. Multiple cameras share
+        # one registry: the first step() call of a tick solves, the rest
+        # skip via _last_solve_frame.
         self._solve_pending(frame_id)
+
+        # Ground truth for "is this identity currently claimed by someone
+        # else" is whoever BoT-SORT actually reports as tracked *this
+        # frame* - not entry.active_tid by itself. BoT-SORT only calls
+        # deactivate_track() once a lost track is permanently removed
+        # (after the full max_time_lost buffer, tens of seconds), so a
+        # quick exit-and-reentry would otherwise still see the old identity
+        # as "claimed" and get minted a new global_id instead of being
+        # re-identified.
         live_tids = {t.track_id for t in tracker.tracked_stracks}
 
-        
+        # --- Pairwise inter-track overlap (occlusion proxy) ----------------
+        # Compute max IoU of each live track against every other live track.
+        # Used to (a) scale down centroid updates for overlapping tracks and
+        # (b) freeze global_id assignment while two people are overlapping.
         live = tracker.tracked_stracks
         if len(live) >= 2:
-            iou_cost = matching.iou_distance(live, live) 
+            iou_cost = matching.iou_distance(live, live)          # 1 - IoU
             iou_mat = 1.0 - iou_cost
             np.fill_diagonal(iou_mat, 0.0)
             peer_iou_vals = iou_mat.max(axis=1)

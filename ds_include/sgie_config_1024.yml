@@ -1,0 +1,25 @@
+property:
+  gpu-id: 0
+  net-scale-factor: 0.01735207357279195
+  offsets: 123.675;116.28;103.53
+  model-color-format: 0
+  onnx-file: /home/lakshh/workspace/reid/impl_bot/bot_sort_ds_impl/ds_include/onnx_model/bench/resnet50_market1501_1024_synthetic.onnx
+  model-engine-file: /home/lakshh/workspace/reid/impl_bot/bot_sort_ds_impl/ds_include/onnx_model/bench/resnet50_market1501_1024_synthetic.onnx_b50_gpu0_fp16.engine
+  infer-dims: 3;256;128
+  batch-size: 50
+  network-mode: 2
+  network-type: 100
+  interval: 0
+  process-mode: 2
+  classifier-threshold: 0
+  output-tensor-meta: 1
+  maintain-aspect-ratio: 0
+  operate-on-class-ids: 0
+  scaling-compute-hw: 1
+  gie-unique-id: 2
+
+# NOTE: 1024-d embedding head is a randomly-initialized Gemm projection
+# spliced onto the 2048-d ResNet50/market1501 backbone (see
+# ds_include/onnx_model/bench/resnet50_market1501_1024_synthetic.onnx and
+# the generating script). Valid for compute-load benchmarking only -- do
+# NOT use for real re-identification, the head is untrained.

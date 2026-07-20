@@ -1,0 +1,24 @@
+property:
+  gpu-id: 0
+  net-scale-factor: 0.01735207357279195
+  offsets: 123.675;116.28;103.53
+  model-color-format: 0
+  onnx-file: /home/lakshh/workspace/reid/impl_bot/bot_sort_ds_impl/ds_include/onnx_model/bench/resnet50_market1501_2048.onnx
+  model-engine-file: /home/lakshh/workspace/reid/impl_bot/bot_sort_ds_impl/ds_include/onnx_model/bench/resnet50_market1501_2048.onnx_b50_gpu0_fp16.engine
+  infer-dims: 3;256;128
+  batch-size: 50
+  network-mode: 2
+  network-type: 100
+  interval: 0
+  process-mode: 2
+  classifier-threshold: 0
+  output-tensor-meta: 1
+  maintain-aspect-ratio: 0
+  operate-on-class-ids: 0
+  scaling-compute-hw: 1
+  gie-unique-id: 2
+
+# NOTE: full 2048-d embedding from resnet50_market1501.onnx (this repo's
+# own FastReID export), no reduction head. Input batch dim was made
+# dynamic (was fixed to 1 in the original export) so it can be profiled
+# across batch sizes -- see ds_include/onnx_model/bench/resnet50_market1501_2048.onnx.
