@@ -1,47 +1,3 @@
-"""
-Global Tracklet Association (GTA) — tracklet-level, windowed cross-camera re-ID.
-
-global_registry.py's GlobalRegistry decides identity per frame, per observation:
-every unresolved live track gets a FAISS cosine query every tick, and outside the
-narrow AMBIGUOUS/claimed cases (deferred to a periodic Hungarian solver) commits a
-MATCH/NO_MATCH decision immediately off a single frame's embedding. Once
-track.t_global_id is set it's never re-verified (short of the identity_revoke_streak
-safety net) - a bad early observation (blur, occlusion, a lookalike) can lock in a
-wrong global_id that then gets reinforced every subsequent frame via the EMA centroid
-update.
-
-GTA replaces that with a tracklet-level, windowed decision policy - and, unlike a
-first pass at this design, identities are not a persistent gallery either. There is
-no GalleryEntry-style object that lives across ticks accumulating an EMA centroid
-that tracklets get matched against. Instead:
-
-  - Every tracklet (STrack) becomes one TrackletNode - first_visible, last_visible,
-    smoothed feature, camera - kept in one flat pool (`GTA._nodes`) for as long as
-    it's live or recently closed.
-  - Once every `window_frames` (~60s @ 30fps by default), GTA builds the FULL
-    pairwise graph over every node still in that pool - not just ones that showed up
-    since the last tick - and reconverges the whole thing into identity groups from
-    scratch via a Gaussian log-likelihood edge score + greedy union-find. A node's
-    previous identity label is only used as a tie-break for which label a merged
-    group keeps (see `_run_tick`), not as ground truth to match new evidence
-    against - nothing needs to "survive" a window on its own, because the whole
-    graph is what's judged, every time.
-  - `IdentityCluster` is a read-only summary computed fresh after each tick
-    (first/last visible, cameras seen, an average feature for logging) - not
-    mutable matching state.
-
-Two tracklets are linked only if they're temporally disjoint (one fully ends before
-the other starts - the same non-overlapping-FOV assumption multi_camera_tracker.py
-already documents) and the log-likelihood combining an appearance term and a
-time-gap term clears a threshold.
-
-Signature-compatible with GlobalRegistry (`step(tracker, frame_id)`,
-`deactivate_track(track_id)`) so botsort/multi_camera_tracker.py and bot_sort.py's
-`self.registry.deactivate_track(...)` call site need zero changes - this is a
-drop-in swap of the matching brain, `BoTSORT`/`STrack`/`MultiCameraTracker` are
-reused as-is.
-"""
-
 from __future__ import annotations
 
 import json
@@ -49,15 +5,25 @@ import math
 import os
 import queue
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
+import faiss
+from scipy.optimize import linear_sum_assignment
+from sklearn.cluster import DBSCAN
+
+from . import matching
+from .priors import SpatioTemporalPrior
 
 SQRT_2PI = math.sqrt(2.0 * math.pi)
 
 
-class CameraTopologyPrior:
+def _gaussian_log_likelihood(x: float, mu: float, sigma: float) -> float:
+    return -0.5 * ((x - mu) / sigma) ** 2 - math.log(sigma * SQRT_2PI)
+
+
+class CameraTopologyPrior:  
     def __init__(self, bonuses: Optional[dict] = None, default: float = 0.0):
         self._bonuses = {self._canon(a, b): v for (a, b), v in (bonuses or {}).items()}
         self._default = default
@@ -73,186 +39,309 @@ class CameraTopologyPrior:
 
 
 @dataclass
-class GTAConfig:
-    sigma_feat: float
-    mu_gap_sec: float
-    sigma_gap_sec: float
-    frame_rate: float
-    camera_prior: Optional[CameraTopologyPrior] = None
+class FeatureStreamConfig:
+    """Calibration for one named ReID embedding stream (one model).
+
+    name                   : must match the key used in STrack.smooth_feats
+                              (e.g. "reidnet", "clipreid").
+    weight                 : this stream's contribution to the combined
+                              appearance log-likelihood - independent models
+                              can be trusted more or less (a stronger
+                              discriminator gets a higher weight).
+    sigma_feat             : cosine-distance std for this stream's Gaussian
+                              appearance term.
+    outlier_reject_thresh  : cosine-distance floor above which a new
+                              observation is "confidently inconsistent" with
+                              this stream's established centroid and is
+                              dropped rather than blended in (see
+                              GalleryEntry.add_evidence). Also used to derive
+                              this stream's share of the default
+                              new-identity cost (see GTA.__init__).
+    is_primary             : exactly one stream should be marked primary -
+                              it backs the FAISS fast-commit index and is the
+                              stream BoT-SORT's own short-term association
+                              keeps using via STrack.smooth_feat/curr_feat
+                              (see bot_sort.py). If none is marked, the first
+                              stream in the list is used.
+    """
+    name: str
+    weight: float = 1.0
+    sigma_feat: float = 0.15
+    outlier_reject_thresh: float = 0.30
+    is_primary: bool = False
+
+
+def multi_model_log_likelihood(feats_a: dict, feats_b: dict, streams: dict) -> Optional[float]:
+    """Weighted sum of per-stream Gaussian appearance log-likelihoods, over
+    whichever stream names both feature bundles actually share. None if they
+    share no configured stream in common - nothing to compare (e.g. one
+    tracklet only ever got a "reidnet" embedding, the gallery entry only has
+    "clipreid" - shouldn't normally happen since both run every frame, but a
+    momentarily-missing model shouldn't crash the solver)."""
+    common = [name for name in streams if name in feats_a and name in feats_b]
+    if not common:
+        return None
+    total = 0.0
+    for name in common:
+        cfg = streams[name]
+        cos_dist = 1.0 - float(np.dot(feats_a[name], feats_b[name]))
+        total += cfg.weight * _gaussian_log_likelihood(cos_dist, 0.0, cfg.sigma_feat)
+    return total
+
+
+class GalleryEntry:
+    """One real-world identity, living in the gallery for the lifetime of the
+    process (never pruned) - this unbounded lifetime is what fixes the old
+    GTA's "reappear after prune_after_frames and you're unlinkable forever"
+    failure mode.
+
+    Appearance is summarized as one EMA centroid PER STREAM (one per ReID
+    model), each gated independently against corruption by
+    `add_evidence`'s per-stream outlier check.
+    """
+
+    def __init__(self, global_id: int, feats: dict, frame_id: int,
+                 bbox: Optional[np.ndarray], ema_alpha: float = 0.9, cam_source=None):
+        self.global_id = global_id
+        self.active_tid: Optional[int] = None
+        self.last_frame = frame_id
+        self.last_bbox = bbox.copy() if bbox is not None else None
+        self.ema_alpha = ema_alpha
+        self.centroids: dict = {name: vec.copy() for name, vec in feats.items()}
+        self.update_count = 1
+        # Logging-only: which camera last claimed this identity.
+        self.last_cam_source = cam_source
+        # Consecutive REJECTED tracklet-level observations (weighted-majority
+        # verdict across streams, see add_evidence) for whoever currently
+        # holds active_tid. Mirrors GlobalRegistry's identity_revoke_streak -
+        # if BoT-SORT's own association silently handed this track_id to a
+        # different person, this is what eventually notices and revokes.
+        self.mismatch_streak = 0
+
+    def add_evidence(self, feats: dict, frame_id: int, bbox: Optional[np.ndarray],
+                      stream_cfg: dict, occlusion_score: float = 0.0) -> bool:
+        """Blend a new tracklet observation's per-stream features into this
+        identity's centroids. Each stream is gated independently against ITS
+        OWN centroid (a bad frame on one model can't corrupt another
+        model's), but the overall accept/reject verdict - what
+        `mismatch_streak` counts, and therefore what identity_revoke_streak
+        eventually acts on - is a WEIGHTED-MAJORITY vote across streams, so
+        one model's transient noise can't revoke a good identity on its own.
+
+        occlusion_score (0.0-1.0): scales down the new observation's
+        contribution the same way GlobalRegistry's did - effective_alpha ->
+        1.0 (freeze) as occlusion_score -> 1.0.
+        """
+        self.last_frame = frame_id
+        if bbox is not None:
+            self.last_bbox = bbox.copy()
+
+        reject_weight = 0.0
+        total_weight = 0.0
+        effective_alpha = self.ema_alpha + (1.0 - self.ema_alpha) * float(occlusion_score)
+        for name, vec in feats.items():
+            cfg = stream_cfg.get(name)
+            if cfg is None:
+                continue
+            if name not in self.centroids:
+                # A stream this identity hasn't seen before (e.g. a model
+                # that was momentarily missing on earlier observations) -
+                # seed it rather than gating against a centroid that doesn't
+                # exist yet.
+                self.centroids[name] = vec.copy()
+                continue
+            total_weight += cfg.weight
+            cos_dist = 1.0 - float(np.dot(self.centroids[name], vec))
+            if cos_dist >= cfg.outlier_reject_thresh:
+                reject_weight += cfg.weight
+                continue
+            c = effective_alpha * self.centroids[name] + (1.0 - effective_alpha) * vec
+            cn = np.linalg.norm(c)
+            self.centroids[name] = (c / cn).astype(np.float32) if cn > 1e-9 else c.astype(np.float32)
+
+        self.update_count += 1
+        accepted = total_weight <= 0.0 or reject_weight < 0.5 * total_weight
+        if accepted:
+            self.mismatch_streak = 0
+        else:
+            self.mismatch_streak += 1
+        return accepted
+
+    def __repr__(self):
+        return (f"GalleryEntry(gid={self.global_id}, tid={self.active_tid}, "
+                f"streams={sorted(self.centroids.keys())}, n_updates={self.update_count}, "
+                f"last_frame={self.last_frame})")
 
 
 @dataclass
-class TrackletNode:
+class TrackletEvidence:
     tid: int
     cam_source: object
-    track_ref: object                       # STrack while open; cleared on close
-    first_visible: int                      # DS shared frame_id, first qualifying obs
-    last_visible: int                       # DS shared frame_id, most recent obs
-    feat: np.ndarray
-    closed: bool = False
-    identity_id: Optional[int] = None       # label from the most recent tick's convergence
-
-
-class IdentityCluster:
-    def __init__(self, identity_id: int):
-        self.identity_id = identity_id
-        self.first_visible: Optional[int] = None
-        self.last_visible: Optional[int] = None
-        self.cams_seen: set = set()
-        self.member_count = 0
-        self._feat_sum: Optional[np.ndarray] = None
-
-    def _add(self, node: TrackletNode) -> None:
-        self.first_visible = node.first_visible if self.first_visible is None else min(self.first_visible, node.first_visible)
-        self.last_visible = node.last_visible if self.last_visible is None else max(self.last_visible, node.last_visible)
-        self.cams_seen.add(node.cam_source)
-        self.member_count += 1
-        self._feat_sum = node.feat.copy() if self._feat_sum is None else self._feat_sum + node.feat
-
-    @property
-    def centroid(self) -> Optional[np.ndarray]:
-        if self._feat_sum is None:
-            return None
-        n = np.linalg.norm(self._feat_sum)
-        return (self._feat_sum / n).astype(np.float32) if n > 1e-9 else self._feat_sum.astype(np.float32)
-
-    def __repr__(self):
-        return (f"IdentityCluster(id={self.identity_id}, members={self.member_count}, "
-                f"cams={sorted(self.cams_seen, key=str)}, last_visible={self.last_visible})")
-
-
-def pairwise_log_likelihood(a: TrackletNode, b: TrackletNode, cfg: GTAConfig) -> Optional[float]:
-    """Log-likelihood that tracklet nodes `a` and `b` are the same real-world
-    identity.
-
-    Returns None if they're structurally impossible: overlapping visibility
-    windows mean one body was in two places at once (non-overlapping-FOV
-    assumption, same as multi_camera_tracker.py's docstring) - this is a hard
-    veto, not a low score, so it can never be outvoted by a strong appearance
-    match.
-
-    Otherwise: log P(same identity) = log P_appearance(cos_dist) +
-    log P_gap(elapsed seconds) [+ log-bonus from an optional camera prior,
-    inactive by default]. Two independent Gaussian terms rather than a single
-    multivariate Gaussian over the raw embedding - simpler to calibrate and
-    only needs a scalar cosine-distance/time-gap sample per pair, not enough
-    per-identity samples to estimate a full covariance matrix.
-    """
-    if a.last_visible >= b.first_visible and b.last_visible >= a.first_visible:
-        return None
-
-    early, late = (a, b) if a.last_visible < b.first_visible else (b, a)
-
-    cos_dist = 1.0 - float(np.dot(a.feat, b.feat))
-    feat_ll = -0.5 * (cos_dist / cfg.sigma_feat) ** 2 - math.log(cfg.sigma_feat * SQRT_2PI)
-
-    gap_sec = (late.first_visible - early.last_visible) / cfg.frame_rate
-    time_ll = (-0.5 * ((gap_sec - cfg.mu_gap_sec) / cfg.sigma_gap_sec) ** 2
-               - math.log(cfg.sigma_gap_sec * SQRT_2PI))
-
-    cam_ll = 0.0
-    if cfg.camera_prior is not None and a.cam_source is not None and b.cam_source is not None:
-        cam_ll = cfg.camera_prior.log_bonus(a.cam_source, b.cam_source)
-
-    return feat_ll + time_ll + cam_ll
-
-
-def _intervals_conflict(a_list, b_list) -> bool:
-    """True if any (first_visible, last_visible) interval in a_list overlaps any
-    interval in b_list - used to veto a graph merge that would put two
-    temporally-overlapping tracklets in the same identity group, even when
-    neither of them is the direct edge that triggered the merge (the usual
-    correlation-clustering trap: A-B and B-C can each look fine locally while
-    A-C overlap)."""
-    for a0, a1 in a_list:
-        for b0, b1 in b_list:
-            if a1 >= b0 and b1 >= a0:
-                return True
-    return False
+    track_ref: object
+    first_visible: int
+    last_visible: int
+    feats: dict
+    bbox: Optional[np.ndarray] = None
+    cannot_link_gids: set = field(default_factory=set)
+    hits: int = 1
+    dead: bool = False
+    # Set by _try_fast_commit(): this tracklet was handed an identity
+    # immediately (skipping the queue), but NOT yet confirmed - it stays in
+    # the pending pool so the next _solve_pending tick re-evaluates it
+    # against the whole gallery with full exclusivity, same as any other
+    # pending tracklet. If the solver agrees, this is a no-op (confirm); if
+    # it disagrees, the tracklet is reassigned there (correct) - see
+    # _try_fast_commit's docstring for why this is the fix for a fast-commit
+    # that can otherwise never be undone.
+    provisional_gid: Optional[int] = None
 
 
 class GTA:
-    """See module docstring. `window_frames`/`min_tracklet_len`/`sigma_feat`/
-    `mu_gap_sec`/`sigma_gap_sec`/`link_threshold` all need empirical calibration
-    against the CHIRLA harness (evaluate_tracking.py) - the defaults here are a
-    starting point, not tuned values (same posture GlobalRegistry's docstring
-    already takes for its own thresholds).
+    """See module docstring. All thresholds need empirical calibration
+    against the CHIRLA harness (evaluate_tracking.py) - the defaults here
+    are starting points carried over from GlobalRegistry's own previously-
+    used values where a direct analogue exists, not tuned values (same
+    posture every threshold in this codebase already takes).
 
-    window_frames    : tick interval - the tracklet graph is only ever
-                        reconverged into identities once per this many frames
-                        (~60s @ 30fps by default), never per frame.
-    min_tracklet_len  : frames a tracklet must survive before it's trusted enough
-                        to become a node (mirrors GlobalRegistry's min_frames).
-    sigma_feat        : cosine-distance std for the appearance Gaussian term.
-    mu_gap_sec/sigma_gap_sec : center/spread of the time-gap Gaussian term - a
-                        loose prior in the absence of a per-camera-pair topology
-                        (see CameraTopologyPrior).
-    link_threshold    : minimum combined log-likelihood to keep a candidate edge
-                        in the tick's graph. With the defaults, the best possible
-                        score (identical features, gap exactly at mu_gap_sec) is
-                        about -2.9 - the default threshold leaves headroom below
-                        that for real-world jitter while still rejecting weak
-                        pairs; recalibrate alongside sigma_feat/sigma_gap_sec.
-    ema_alpha         : unused by matching (kept for interface parity / future
-                        use); nothing in GTA maintains an EMA-updated centroid
-                        anymore - see module docstring.
-    prune_after_frames: tracklet nodes unseen for longer than this are dropped
-                        from the graph entirely (default 5 * window_frames, ~5
-                        minutes) - this is what keeps the full-graph rebuild
-                        each tick bounded in size, and is the only sense in
-                        which anything "expires": individual nodes age out,
-                        there is no separate cluster-level TTL.
-    camera_prior      : optional CameraTopologyPrior; None (inactive) by default.
-    frame_rate        : frame <-> seconds conversion.
+    streams                : list[FeatureStreamConfig], one per ReID model.
+                              Defaults to a single stream named "primary"
+                              (matches STrack._DEFAULT_STREAM) for back-
+                              compat with a single-SGIE pipeline.
+    min_tracklet_len       : frames a tracklet must survive before it's
+                              trusted enough to enter the pending pool
+                              (mirrors GlobalRegistry's min_frames / the old
+                              GTA's min_tracklet_len).
+    solver_interval_frames : how often the Hungarian batch solve over the
+                              pending pool runs (mirrors the old GTA's
+                              window_frames / GlobalRegistry's
+                              solver_interval_frames).
+    mu_gap_sec/sigma_gap_sec : center/spread of the time-gap Gaussian term -
+                              a loose prior in the absence of real per-
+                              camera-pair topology (see camera_prior).
+    new_identity_cost      : flat override for tau_new (the solver's dummy
+                              "mint a fresh identity" column cost). If None
+                              (default), computed PER TRACKLET from exactly
+                              the streams it has evidence for, as the cost
+                              of "a borderline-rejected observation" on each
+                              (see __init__) - a real gallery candidate must
+                              beat that to win the tracklet.
+    fast_commit_thresh/min_margin : gate the optional fast-commit path
+                              (FAISS top-2 + margin on the primary stream) -
+                              deliberately tighter than the solver's implicit
+                              acceptance bar, since a false positive here
+                              bypasses Hungarian exclusivity entirely.
+    identity_revoke_streak : see GalleryEntry.add_evidence / mismatch_streak.
+    overlap_freeze_thresh/overlap_cooldown_frames : while two tracks overlap
+                              (occlusion proxy via peer IOU), don't refresh
+                              or query a not-yet-identified tracklet's
+                              evidence; after separation, wait
+                              overlap_cooldown_frames for the embedding to
+                              recover. Mirrors GlobalRegistry exactly.
+    confusion_eps/confusion_refresh_interval : periodic DBSCAN over gallery
+                              primary-stream centroids to detect suspiciously
+                              close identity pairs (hard samples) - tightens
+                              the FAST-COMMIT path's thresholds for those
+                              entries specifically. The batch solver doesn't
+                              need this: Hungarian exclusivity already
+                              structurally prevents two candidates both
+                              winning one identity.
     """
 
     def __init__(
         self,
-        window_frames: int = 1800,
+        streams: Optional[list] = None,
         min_tracklet_len: int = 30,
-        sigma_feat: float = 0.15,
-        mu_gap_sec: float = 2.0,
+        solver_interval_frames: int = 600,
+        mu_gap_sec: float = 0.5,
         sigma_gap_sec: float = 20.0,
-        link_threshold: float = -6.0,
+        new_identity_cost: Optional[float] = None,
+        fast_commit_thresh: float = 0.2,
+        min_margin: float = 0.09,
         ema_alpha: float = 0.9,
-        prune_after_frames: Optional[int] = None,
+        identity_revoke_streak: int = 5,
+        overlap_freeze_thresh: float = 0.3,
+        overlap_cooldown_frames: int = 10,
+        confusion_eps: float = 0.15,
+        confusion_refresh_interval: int = 100,
         camera_prior: Optional[CameraTopologyPrior] = None,
+        st_prior: Optional[SpatioTemporalPrior] = None,
         frame_rate: float = 30.0,
+        use_gpu: bool = True,
         reid_log_path: Optional[str] = None,
         log_flush_interval: int = 500,
     ):
-        self.window_frames = window_frames
+        if not streams:
+            streams = [FeatureStreamConfig(name="primary", is_primary=True)]
+        self._stream_cfg: dict = {s.name: s for s in streams}
+        primary = next((s.name for s in streams if s.is_primary), streams[0].name)
+        self._primary_stream = primary
+
         self.min_tracklet_len = min_tracklet_len
-        self.link_threshold = link_threshold
+        self.solver_interval_frames = solver_interval_frames
+        self.mu_gap_sec = mu_gap_sec
+        self.sigma_gap_sec = sigma_gap_sec
+        self.fast_commit_thresh = fast_commit_thresh
+        self.min_margin = min_margin
         self.ema_alpha = ema_alpha
-        self.prune_after_frames = (
-            prune_after_frames if prune_after_frames is not None else 5 * window_frames
-        )
-        self.cfg = GTAConfig(
-            sigma_feat=sigma_feat, mu_gap_sec=mu_gap_sec, sigma_gap_sec=sigma_gap_sec,
-            frame_rate=frame_rate, camera_prior=camera_prior,
-        )
+        self.identity_revoke_streak = identity_revoke_streak
+        self.overlap_freeze_thresh = overlap_freeze_thresh
+        self.overlap_cooldown_frames = overlap_cooldown_frames
+        self.confusion_eps = confusion_eps
+        self.confusion_refresh_interval = confusion_refresh_interval
+        self.camera_prior = camera_prior
+        self.st_prior = st_prior
+        self.frame_rate = frame_rate
 
-        # The tracklet graph: every node GTA currently knows about, open or
-        # closed, keyed by track_id (already globally unique - see
-        # ID_Assigner(init_id=cam_source*1000) in bot_sort.py). Nothing here is
-        # a persistent "gallery" - identity_id on a node is just last tick's
-        # answer, recomputed from this same pool every tick.
-        self._nodes: dict[int, TrackletNode] = {}
-        self._clusters: dict[int, IdentityCluster] = {}   # last tick's summary
-        self._next_identity_id = 1
-        self._last_tick_frame = 0
-        # cam_source -> tracklets whose identity_id CHANGED on the most recent
-        # tick, consumed exactly once (per camera) by the next step() call for
-        # that camera - see step()'s docstring for why this can't just be an
-        # instance list reset on every step() call.
-        self._pending_report: dict = {}
+        # Per-stream appearance log-likelihood AT the "borderline rejected
+        # observation" boundary (cos_dist == outlier_reject_thresh) - always
+        # negative. Combined with _time_best_ll (the time term's own ceiling
+        # - gap_sec exactly at mu_gap_sec) below, this gives a
+        # same-units-as-the-real-cost-matrix "boundary" combined
+        # log-likelihood: a real candidate must do BETTER than "borderline
+        # appearance + best-possible timing" to win, whether that candidate
+        # is another pending tracklet (_cluster_pending) or an existing
+        # gallery identity (_solve_pending)'s dummy new-identity column.
+        #
+        # This isn't optional bookkeeping: sigma_gap_sec's own Gaussian
+        # normalization constant (-log(sigma_gap_sec*sqrt(2*pi))) is
+        # strongly negative for any reasonably loose time prior (e.g. -3.9
+        # at sigma_gap_sec=20), so a purely-appearance-based threshold
+        # would incorrectly veto even a perfect appearance+timing match -
+        # the same normalization-constant trap the old GTA's manually-tuned
+        # link_threshold=-6.0 existed to work around.
+        self._time_best_ll = _gaussian_log_likelihood(self.mu_gap_sec, self.mu_gap_sec, self.sigma_gap_sec)
+        self._per_stream_reject_ll = {
+            name: cfg.weight * _gaussian_log_likelihood(cfg.outlier_reject_thresh, 0.0, cfg.sigma_feat)
+            for name, cfg in self._stream_cfg.items()
+        }
+        self._flat_new_identity_cost = new_identity_cost
 
-        # Optional non-blocking per-tick log of resolved-identity centroids.
-        # Same queue+background-thread shape as GlobalRegistry's _log_worker
-        # (global_registry.py:879-903) so the GStreamer thread never blocks on
-        # disk I/O - but far lower volume here since GTA only writes once per
-        # tick, not once per frame.
+        self._tid_cooldown: dict[int, int] = {}
+        self._confusion_gids: set[int] = set()
+        self._last_confusion_refresh: int = 0
+
+        self._pending: dict[int, TrackletEvidence] = {}
+        self._last_solve_frame: int = 0
+        # gid -> frame_id at which an OWNED live track last refreshed that
+        # identity - read when refreshing pending evidence / building the
+        # solver's cost matrix so an identity actively worn by someone else
+        # can't be double-claimed (co-occurrence cannot-link).
+        self._gid_seen_at: dict[int, int] = {}
+
+        self._next_gid = 1
+        self._gallery: dict[int, GalleryEntry] = {}
+        self._tid_to_gid: dict[int, int] = {}
+
+        # FAISS index over primary-stream centroids only - backs the
+        # fast-commit path. The batch solver doesn't use FAISS at all (its
+        # cost matrix is dense over the pending pool x gallery, both
+        # expected to stay small - "one camera network's worth of people").
+        self._use_gpu = use_gpu
+        self._fast_index: Optional[faiss.Index] = None
+        self._fast_index_dim: Optional[int] = None
+        self._fast_index_gids: list[int] = []
+        self._gallery_dirty = False
+
         self.reid_log_path = reid_log_path
         self.log_flush_interval = log_flush_interval
         self._log_queue: "queue.Queue" = queue.Queue()
@@ -265,156 +354,568 @@ class GTA:
             )
             self._log_thread.start()
 
+    def _boundary_ll(self, stream_names) -> float:
+        """Combined log-likelihood of 'a borderline-rejected observation on
+        each of these streams, arriving at exactly the best possible time' -
+        the merge/match acceptance floor shared by _cluster_pending and
+        _new_identity_cost_feats."""
+        return sum(self._per_stream_reject_ll.get(name, 0.0) for name in stream_names) + self._time_best_ll
+
     # --- per-frame driver --------------------------------------------------
 
     def step(self, tracker, frame_id: int) -> list:
         """Run once per camera per batch tick (same call site/contract as
-        GlobalRegistry.step - see multi_camera_tracker.py). Does only cheap
-        per-frame bookkeeping (open/refresh this tracker's tracklet nodes); the
-        actual identity decision only happens inside _run_tick, at most once
-        every `window_frames`.
+        the old GTA/GlobalRegistry - see multi_camera_tracker.py). Cheap
+        per-frame bookkeeping (refresh already-identified centroids, refresh
+        pending evidence, attempt the fast-commit path) every call; the
+        Hungarian batch solve only runs once every `solver_interval_frames`.
 
-        Returns the STracks whose identity_id changed on the most recent tick,
-        scoped to THIS tracker's camera and reported exactly once. The tick
-        itself reconverges the whole tracklet graph across every camera sharing
-        this GTA instance in one shot, so whichever camera's step() call happens
-        to cross the window_frames threshold reports only its own
-        newly-changed tracks; _pending_report holds the rest until that
-        camera's own step() call runs later in the same batch tick
-        (MultiCameraTracker.update_batch calls every camera once per tick, so
-        this always resolves within the same tick).
+        Returns the STracks whose t_global_id was just resolved during this
+        call - a fresh fast-commit, or a batch-solve outcome, this tick.
         """
         cam_source = getattr(tracker, "cam_source", None)
+        assigned_this_step: list = []
 
-        for track in tracker.tracked_stracks:
-            if track.is_touching_edge or track.tracklet_len < self.min_tracklet_len or track.smooth_feat is None:
+        self._refresh_confusion_zones(frame_id)
+
+        live = tracker.tracked_stracks
+        live_tids = {t.track_id for t in live}
+
+        # --- Pairwise inter-track overlap (occlusion proxy), same as
+        # GlobalRegistry: scales down centroid updates and freezes pending
+        # evidence while two people overlap.
+        if len(live) >= 2:
+            iou_cost = matching.iou_distance(live, live)
+            iou_mat = 1.0 - iou_cost
+            np.fill_diagonal(iou_mat, 0.0)
+            peer_iou_vals = iou_mat.max(axis=1)
+        else:
+            peer_iou_vals = np.zeros(len(live))
+        track_overlap = {t.track_id: float(peer_iou_vals[i]) for i, t in enumerate(live)}
+
+        for track in live:
+            tid = track.track_id
+            occlusion_score = track_overlap.get(tid, 0.0)
+            ev = self._pending.get(tid)
+            provisional = ev is not None and ev.provisional_gid is not None
+
+            if track.t_global_id != 0 and not provisional:
+                # Solver-confirmed (or never went through the fast-commit
+                # path at all): fully trusted, gets the always-refresh +
+                # revoke-streak treatment.
+                self._refresh_identified(track, cam_source, frame_id, occlusion_score)
                 continue
-            node = self._nodes.get(track.track_id)
-            if node is None:
-                self._nodes[track.track_id] = TrackletNode(
-                    tid=track.track_id, cam_source=cam_source, track_ref=track,
-                    first_visible=frame_id, last_visible=frame_id,
-                    feat=track.smooth_feat.astype(np.float32).copy(),
-                )
-            elif not node.closed:
-                node.last_visible = frame_id
-                node.feat = track.smooth_feat.astype(np.float32).copy()
 
-        if frame_id - self._last_tick_frame >= self.window_frames:
-            self._last_tick_frame = frame_id
-            self._run_tick(frame_id)
-
-        newly = self._pending_report.pop(cam_source, [])
-        return [n.track_ref for n in newly if n.track_ref is not None]
-
-    def deactivate_track(self, track_id: int) -> None:
-        """Call when BoT-SORT permanently removes a track_id (bot_sort.py's
-        max_time_lost path) - unchanged call site, mirrors
-        GlobalRegistry.deactivate_track. Freezes the node's evidence (last
-        real last_visible/feat) but keeps it in the graph - a closed tracklet
-        is still fully eligible to be matched against future ones until it
-        ages out via prune_after_frames."""
-        node = self._nodes.get(track_id)
-        if node is None:
-            return
-        node.closed = True
-        node.track_ref = None
-
-    # --- windowed tick: rebuild the whole graph, converge, prune -----------
-
-    def _run_tick(self, frame_id: int) -> None:
-        """Reconverge the ENTIRE tracklet graph (every node still in
-        self._nodes, not just ones added since the last tick) into identity
-        groups from scratch. A node's prior identity_id is used only to decide
-        which label a merged group keeps (lowest existing id wins, for
-        continuity/display stability) - it is not treated as ground truth that
-        new evidence must be matched against, so nothing about a group's
-        membership is "locked in" between ticks.
-        """
-        nodes = list(self._nodes.values())
-        n = len(nodes)
-
-        parent = list(range(n))
-        group_intervals = [[(nd.first_visible, nd.last_visible)] for nd in nodes]
-        group_identity = [nd.identity_id for nd in nodes]
-
-        def find(x):
-            while parent[x] != x:
-                parent[x] = parent[parent[x]]
-                x = parent[x]
-            return x
-
-        if n > 1:
-            edges = []
-            for i in range(n):
-                for j in range(i + 1, n):
-                    score = pairwise_log_likelihood(nodes[i], nodes[j], self.cfg)
-                    if score is not None and score >= self.link_threshold:
-                        edges.append((score, i, j))
-            edges.sort(key=lambda e: e[0], reverse=True)
-
-            for score, i, j in edges:
-                ri, rj = find(i), find(j)
-                if ri == rj:
-                    continue
-                if (group_identity[ri] is not None and group_identity[rj] is not None
-                        and group_identity[ri] != group_identity[rj]):
-                    continue  # would merge two distinct existing identities - reject
-                if _intervals_conflict(group_intervals[ri], group_intervals[rj]):
-                    continue
-                # Keep the lower-index root as parent so an existing identity
-                # label already sitting at group_identity[rj] (with none at ri)
-                # isn't silently dropped.
-                if group_identity[ri] is None and group_identity[rj] is not None:
-                    ri, rj = rj, ri
-                parent[rj] = ri
-                group_intervals[ri].extend(group_intervals[rj])
-                if group_identity[ri] is None:
-                    group_identity[ri] = group_identity[rj]
-
-        groups: dict[int, list[int]] = {}
-        for idx in range(n):
-            groups.setdefault(find(idx), []).append(idx)
-
-        resolved_nodes: list[TrackletNode] = []
-        for root, idxs in groups.items():
-            final_id = group_identity[root]
-            if final_id is None:
-                final_id = self._next_identity_id
-                self._next_identity_id += 1
-            since_frame = min(nodes[m].first_visible for m in idxs)
-            for k in idxs:
-                node = nodes[k]
-                if node.identity_id != final_id:
-                    node.identity_id = final_id
-                    if node.track_ref is not None:
-                        node.track_ref.t_global_id = final_id
-                        node.track_ref.t_identity_since_frame = since_frame
-                    resolved_nodes.append(node)
-
-        by_cam: dict = {}
-        for node in resolved_nodes:
-            by_cam.setdefault(node.cam_source, []).append(node)
-        self._pending_report = by_cam
-
-        stale_tids = [tid for tid, nd in self._nodes.items()
-                      if frame_id - nd.last_visible > self.prune_after_frames]
-        for tid in stale_tids:
-            del self._nodes[tid]
-
-        clusters: dict[int, IdentityCluster] = {}
-        for nd in self._nodes.values():
-            if nd.identity_id is None:
+            if track.is_touching_edge or track.tracklet_len < self.min_tracklet_len or not track.smooth_feats:
                 continue
-            clusters.setdefault(nd.identity_id, IdentityCluster(nd.identity_id))._add(nd)
-        self._clusters = clusters
 
-        if self.reid_log_path is not None and self._clusters:
-            snapshot = {cid: c.centroid for cid, c in self._clusters.items() if c.centroid is not None}
+            if occlusion_score > self.overlap_freeze_thresh:
+                self._tid_cooldown[tid] = self.overlap_cooldown_frames
+                continue
+            if self._tid_cooldown.get(tid, 0) > 0:
+                self._tid_cooldown[tid] -= 1
+                continue
+
+            # Not-yet-identified AND provisional (fast-committed but still
+            # awaiting solver confirmation) both keep accumulating PENDING
+            # evidence - the only difference is a provisional tracklet
+            # doesn't get a second fast-commit attempt (it already has a
+            # claim; let the next solve confirm or correct it).
+            self._refresh_pending(track, cam_source, frame_id)
+            if not provisional and self._try_fast_commit(track, cam_source, frame_id, live_tids):
+                assigned_this_step.append(track)
+
+        if self._gallery_dirty:
+            self._rebuild_fast_index()
+            self._gallery_dirty = False
+
+        if frame_id - self._last_solve_frame >= self.solver_interval_frames:
+            self._last_solve_frame = frame_id
+            assigned_this_step.extend(self._solve_pending(frame_id))
+            if self._gallery_dirty:
+                self._rebuild_fast_index()
+                self._gallery_dirty = False
+
+        if self.reid_log_path is not None and assigned_this_step:
+            snapshot = {
+                t.t_global_id: self._gallery[t.t_global_id].centroids.get(self._primary_stream)
+                for t in assigned_this_step if t.t_global_id in self._gallery
+            }
+            snapshot = {k: v for k, v in snapshot.items() if v is not None}
             if snapshot:
                 self._log_queue.put((frame_id, snapshot))
 
-    # --- logging (per-tick, non-blocking) -----------------------------------
+        return assigned_this_step
+
+    def _refresh_identified(self, track, cam_source, frame_id: int, occlusion_score: float) -> None:
+        """A track that already carries a global_id: keep its GalleryEntry's
+        centroids fresh, and watch for a silent identity swap underneath it
+        (BoT-SORT's own IOU association handing this track_id to a different
+        person mid-track) via the mismatch-streak revoke, exactly mirroring
+        GlobalRegistry.step()'s always-refresh behavior for identified
+        tracks."""
+        tid = track.track_id
+        entry = self._gallery.get(track.t_global_id)
+        if entry is None:
+            return
+        entry.active_tid = tid
+        entry.last_cam_source = cam_source
+        self._tid_to_gid[tid] = track.t_global_id
+        self._gid_seen_at[track.t_global_id] = frame_id
+        if not track.smooth_feats or track.is_touching_edge:
+            return
+        self._gallery_dirty = True
+        accepted = entry.add_evidence(track.smooth_feats, frame_id, getattr(track, "tlwh", None),
+                                       self._stream_cfg, occlusion_score=occlusion_score)
+        if not accepted and entry.mismatch_streak >= self.identity_revoke_streak:
+            print(f"[GTA] identity revoked: track={tid} global_id={entry.global_id} "
+                  f"(weighted-majority appearance mismatch {entry.mismatch_streak} observations straight)")
+            entry.active_tid = None
+            entry.mismatch_streak = 0
+            self._tid_to_gid.pop(tid, None)
+            track.t_global_id = 0
+
+    # --- pending pool + fast-commit path ------------------------------------
+
+    def _refresh_pending(self, track, cam_source, frame_id: int) -> None:
+        tid = track.track_id
+        feats_copy = {name: vec.astype(np.float32).copy() for name, vec in track.smooth_feats.items()}
+        bbox_copy = np.asarray(track.tlwh, dtype=np.float64).copy() if hasattr(track, "tlwh") else None
+        ev = self._pending.get(tid)
+        if ev is None:
+            ev = TrackletEvidence(
+                tid=tid, cam_source=cam_source, track_ref=track,
+                first_visible=frame_id, last_visible=frame_id,
+                feats=feats_copy, bbox=bbox_copy,
+            )
+            self._pending[tid] = ev
+        else:
+            ev.last_visible = frame_id
+            ev.feats = feats_copy
+            ev.bbox = bbox_copy
+            ev.hits += 1
+            ev.track_ref = track
+
+        # Cross-camera co-occurrence: any identity actively worn by a
+        # DIFFERENT track this same frame can never be this tracklet - one
+        # body, one place. All cameras sharing this GTA instance stamp
+        # _gid_seen_at with the same frame_id per batch tick (see
+        # MultiCameraTracker.update_batch), so equality means "on screen at
+        # the same instant".
+        for gid, seen_at in self._gid_seen_at.items():
+            if seen_at == frame_id:
+                entry = self._gallery.get(gid)
+                if entry is not None and entry.active_tid not in (None, tid):
+                    ev.cannot_link_gids.add(gid)
+
+    def _try_fast_commit(self, track, cam_source, frame_id: int, live_tids: set) -> bool:
+        """Deliberately conservative: FAISS top-2 + margin on the primary
+        stream only. Lets an obviously-confident re-appearance skip the
+        queue instead of waiting up to solver_interval_frames - kept for
+        latency/UX, not correctness (see module docstring).
+
+        The commit is PROVISIONAL, not final: track.t_global_id is set
+        immediately (so display/downstream consumers see it right away), but
+        the tracklet's evidence stays in the pending pool
+        (TrackletEvidence.provisional_gid marks it) instead of being popped,
+        and its evidence is NOT blended into the gallery centroid yet -
+        deferred until _solve_pending actually re-checks this pairing
+        against the full gallery with exclusivity at the next tick. If the
+        solver agrees, the deferred evidence is folded in then; if it
+        disagrees, the tracklet is reassigned there instead. Without this,
+        a fast-commit is a one-way door - the periodic solver never revisits
+        an already-identified track, so a wrong fast-commit could otherwise
+        never be corrected except via the (much slower, sustained-mismatch-
+        only) identity_revoke_streak safety net.
+        """
+        feat = track.smooth_feats.get(self._primary_stream)
+        if feat is None or self._fast_index is None or self._fast_index.ntotal == 0:
+            return False
+
+        vec = np.ascontiguousarray(feat.astype(np.float32).reshape(1, -1))
+        k = min(2, self._fast_index.ntotal)
+        sims, idxs = self._fast_index.search(vec, k=k)
+        pos = int(idxs[0, 0])
+        if pos < 0:
+            return False
+
+        gid = self._fast_index_gids[pos]
+        cos_dist = 1.0 - float(sims[0, 0])
+        cos_dist2 = 1.0
+        if idxs.shape[1] > 1 and int(idxs[0, 1]) >= 0:
+            cos_dist2 = 1.0 - float(sims[0, 1])
+
+        if gid in self._confusion_gids:
+            eff_thresh, eff_margin = self.fast_commit_thresh * 0.75, self.min_margin * 2.0
+        else:
+            eff_thresh, eff_margin = self.fast_commit_thresh, self.min_margin
+
+        if cos_dist >= eff_thresh or (cos_dist2 - cos_dist) < eff_margin:
+            return False
+
+        tid = track.track_id
+        ev = self._pending.get(tid)
+        if ev is not None and gid in ev.cannot_link_gids:
+            return False
+
+        entry = self._gallery[gid]
+        worn_elsewhere = self._gid_seen_at.get(gid, -1) >= frame_id - 1
+        claimed = (entry.active_tid not in (None, tid)
+                   and (entry.active_tid in live_tids or worn_elsewhere))
+        if claimed:
+            return False
+
+        entry.active_tid = tid
+        entry.last_cam_source = cam_source
+        # NOT entry.add_evidence(...) here - deferred until the solver
+        # confirms this pairing (see docstring). Blending now would let this
+        # tracklet's own evidence contaminate the very centroid the next
+        # solve is supposed to re-check it against.
+        self._tid_to_gid[tid] = gid
+        track.t_global_id = gid
+        track.t_identity_since_frame = frame_id
+        ev = self._pending.get(tid)
+        if ev is not None:
+            ev.provisional_gid = gid
+        # NOT popped from self._pending - stays eligible for the next solve.
+        # NOT self._gallery_dirty - no centroid changed yet, so the FAISS
+        # fast-commit index doesn't need rebuilding for this alone.
+        # Stamp _gid_seen_at here too (not just _refresh_identified) - a
+        # fast-commit that happens mid-tick must be visible to the
+        # co-occurrence veto for any OTHER still-pending tracklet processed
+        # later in this same step() call (including this tick's own solve,
+        # if solver_interval_frames also elapsed this frame) - otherwise a
+        # second lookalike could win the same identity in the same tick
+        # because the claim looked "unseen" to the veto.
+        self._gid_seen_at[gid] = frame_id
+        print(f"[GTA] fast commit (provisional): track={tid} (cam={cam_source}) -> global_id={gid} "
+              f"(dist={cos_dist:.3f}, margin={cos_dist2 - cos_dist:.3f})")
+        return True
+
+    # --- interval-triggered solver: the default decision path --------------
+    #
+    # Two stages per tick, deliberately split because they solve different
+    # problems:
+    #
+    #   Stage 1 (_cluster_pending, GAEC): merges pending tracklets AMONG
+    #   THEMSELVES. This is the case the gallery-assignment stage below
+    #   structurally cannot handle - two brand-new, temporally-disjoint
+    #   tracklets of a person who has no gallery entry yet (nothing to
+    #   anchor a Hungarian match against) would otherwise each mint their
+    #   own identity independently, one tick apart or even the same tick.
+    #   GAEC (borrowed from the previous version of this file) is the right
+    #   tool here: general correlation clustering over a small, per-tick-only
+    #   pool - not a persistent graph re-clustered forever (that was the old
+    #   design's actual bug, not GAEC itself).
+    #
+    #   Stage 2 (_solve_pending, Hungarian): assigns each resulting CLUSTER
+    #   (one merged evidence bundle, one or more member tracklets) to either
+    #   an EXISTING gallery identity or a dummy "new identity" column.
+    #   Column exclusivity is what prevents two lookalike clusters both
+    #   winning the same identity. Unlike stage 1, no temporal-overlap veto
+    #   is needed here: two different clusters are, by construction,
+    #   different people, so at most one can legitimately win any given
+    #   gallery column anyway - the assignment problem already guarantees
+    #   that. The only hard veto still required is a cluster's span
+    #   conflicting with an identity's CURRENTLY-CLAIMED live occupancy
+    #   (the gallery column has no "busy until" state of its own) - reusing
+    #   the exact _gid_seen_at/active_tid co-occurrence check GlobalRegistry
+    #   already gets right.
+
+    def _cluster_pending(self, pendings: list) -> list:
+        """GAEC over the pending pool: repeatedly merge the cluster pair with
+        the largest positive SUM of member-pairwise signed edge weights,
+        stopping once no remaining pair's aggregate is positive. Temporal
+        overlap between any member pair is a hard veto (one body can't be in
+        two places), OR'd forward into the merged cluster so it still blocks
+        a future merge once the original conflicting pair is several hops
+        apart. Returns a list of member groups (list[TrackletEvidence])."""
+        n = len(pendings)
+        cluster_members: dict[int, list[int]] = {c: [c] for c in range(n)}
+        if n <= 1:
+            return [[pendings[idx] for idx in idxs] for idxs in cluster_members.values()]
+
+        def pair_key(a, b):
+            return (a, b) if a < b else (b, a)
+
+        agg: dict[tuple, float] = {}
+        forbidden: dict[tuple, bool] = {}
+        for i in range(n):
+            for j in range(i + 1, n):
+                a, b = pendings[i], pendings[j]
+                key = (i, j)
+                overlap = a.last_visible >= b.first_visible and b.last_visible >= a.first_visible
+                # Two tracklets each provisionally claiming a DIFFERENT
+                # identity is a real contradiction (merging them would mean
+                # deciding they're the same person while also, separately,
+                # already being two different confirmed-pending people) -
+                # hard veto, same shape as the temporal-overlap one. Sharing
+                # the SAME provisional_gid is fine (e.g. one closed and a
+                # later tracklet re-claimed the now-free identity) - that's
+                # a legitimate same-person merge.
+                provisional_conflict = (
+                    a.provisional_gid is not None and b.provisional_gid is not None
+                    and a.provisional_gid != b.provisional_gid
+                )
+                if overlap or provisional_conflict:
+                    agg[key] = 0.0
+                    forbidden[key] = True
+                    continue
+                ll = multi_model_log_likelihood(a.feats, b.feats, self._stream_cfg)
+                if ll is None:
+                    agg[key] = 0.0
+                    forbidden[key] = True
+                    continue
+                early, late = (a, b) if a.last_visible < b.first_visible else (b, a)
+                gap_sec = max((late.first_visible - early.last_visible) / self.frame_rate, 0.0)
+                time_ll = _gaussian_log_likelihood(gap_sec, self.mu_gap_sec, self.sigma_gap_sec)
+                # Zero-crossing point: the same "borderline appearance +
+                # best-possible timing" boundary used for the new-identity
+                # dummy cost (see _new_identity_cost_feats / _boundary_ll) -
+                # two pending tracklets only merge if their combined
+                # evidence does BETTER than that boundary.
+                shared = [name for name in self._stream_cfg if name in a.feats and name in b.feats]
+                agg[key] = (ll + time_ll) - self._boundary_ll(shared)
+                forbidden[key] = False
+
+        while True:
+            best_key, best_val = None, 0.0
+            for key, val in agg.items():
+                if val > best_val and not forbidden.get(key, False):
+                    best_key, best_val = key, val
+            if best_key is None:
+                break
+
+            ca, cb = best_key
+            cluster_members[ca].extend(cluster_members[cb])
+            del cluster_members[cb]
+
+            for ck in list(cluster_members.keys()):
+                if ck == ca:
+                    continue
+                key_a, key_b = pair_key(ca, ck), pair_key(cb, ck)
+                val_b = agg.pop(key_b, None)
+                forb_b = forbidden.pop(key_b, False)
+                if val_b is not None:
+                    agg[key_a] = agg.get(key_a, 0.0) + val_b
+                    forbidden[key_a] = forbidden.get(key_a, False) or forb_b
+            for key in [k for k in agg if cb in k]:
+                agg.pop(key, None)
+                forbidden.pop(key, None)
+
+        return [[pendings[idx] for idx in idxs] for idxs in cluster_members.values()]
+
+    @staticmethod
+    def _merge_cluster(members: list) -> dict:
+        """Combine a GAEC cluster's member tracklets into one evidence
+        bundle: a hits-weighted average per stream (renormalized to unit
+        length), the widest visibility span, and the union of cannot-link
+        constraints. cam_source/bbox are taken from the earliest/latest
+        member respectively - representative points for the gap/camera-prior
+        terms, not evidence themselves."""
+        feat_sums: dict = {}
+        feat_counts: dict = {}
+        cannot_link: set = set()
+        for mm in members:
+            cannot_link |= mm.cannot_link_gids
+            for name, vec in mm.feats.items():
+                feat_sums[name] = feat_sums.get(name, 0.0) + vec.astype(np.float64) * mm.hits
+                feat_counts[name] = feat_counts.get(name, 0) + mm.hits
+        merged_feats = {}
+        for name, s in feat_sums.items():
+            v = s / max(feat_counts[name], 1)
+            n = np.linalg.norm(v)
+            merged_feats[name] = (v / n).astype(np.float32) if n > 1e-9 else v.astype(np.float32)
+
+        earliest = min(members, key=lambda mm: mm.first_visible)
+        latest = max(members, key=lambda mm: mm.last_visible)
+        return {
+            "members": members,
+            "feats": merged_feats,
+            "first_visible": earliest.first_visible,
+            "last_visible": latest.last_visible,
+            "cam_source": earliest.cam_source,
+            "bbox": latest.bbox,
+            "cannot_link_gids": cannot_link,
+        }
+
+    def _new_identity_cost_feats(self, feats: dict) -> float:
+        """tau_new: cost of the dummy 'mint a fresh identity' column, in the
+        same units as a real candidate's cost (-combined_log_likelihood) -
+        see _boundary_ll. A real gallery candidate must do better than
+        'borderline appearance + best-possible timing' to beat this."""
+        if self._flat_new_identity_cost is not None:
+            return self._flat_new_identity_cost
+        return -self._boundary_ll(feats.keys())
+
+    def _solve_pending(self, frame_id: int) -> list:
+        if not self._pending:
+            return []
+
+        pendings = list(self._pending.values())
+        groups = self._cluster_pending(pendings)
+        clusters = [self._merge_cluster(group) for group in groups]
+
+        gids = list(self._gallery.keys())
+        n, m = len(clusters), len(gids)
+        MASKED = 1e6  # >> any real cost
+
+        cost = np.full((n, m + n), MASKED, dtype=np.float64)
+        for i, cl in enumerate(clusters):
+            cost[i, m + i] = self._new_identity_cost_feats(cl["feats"])
+
+        for i, cl in enumerate(clusters):
+            own_tids = {mm.tid for mm in cl["members"]}
+            for j, gid in enumerate(gids):
+                if gid in cl["cannot_link_gids"]:
+                    continue
+                entry = self._gallery[gid]
+                seen_at = self._gid_seen_at.get(gid)
+                if (seen_at is not None and seen_at >= cl["first_visible"]
+                        and entry.active_tid is not None and entry.active_tid not in own_tids):
+                    continue
+
+                ll = multi_model_log_likelihood(cl["feats"], entry.centroids, self._stream_cfg)
+                if ll is None:
+                    continue
+
+                gap_sec = max((cl["first_visible"] - entry.last_frame) / self.frame_rate, 0.0)
+                time_ll = _gaussian_log_likelihood(gap_sec, self.mu_gap_sec, self.sigma_gap_sec)
+                cam_ll = 0.0
+                if self.camera_prior is not None and entry.last_cam_source is not None and cl["cam_source"] is not None:
+                    cam_ll = self.camera_prior.log_bonus(entry.last_cam_source, cl["cam_source"])
+                st_ll = 0.0
+                if self.st_prior is not None:
+                    st_ll = self.st_prior.log_p(
+                        entry.last_cam_source, entry.last_frame / self.frame_rate,
+                        cl["cam_source"], cl["first_visible"] / self.frame_rate,
+                    )
+                cost[i, j] = -(ll + time_ll + cam_ll + st_ll)
+
+        rows, cols = linear_sum_assignment(cost)
+        resolved: list = []
+        for i, j in zip(rows, cols):
+            cl = clusters[i]
+            tids = [mm.tid for mm in cl["members"]]
+            if j < m and cost[i, j] < MASKED:
+                gid = gids[j]
+                entry = self._gallery[gid]
+                entry.last_cam_source = cl["cam_source"]
+                entry.add_evidence(cl["feats"], cl["last_visible"], cl["bbox"], self._stream_cfg)
+                verb, cost_str = "solver match", f"cost={cost[i, j]:.3f}"
+            else:
+                gid = self._register(cl["feats"], cl["last_visible"], cl["bbox"], cam_source=cl["cam_source"])
+                entry = self._gallery[gid]
+                verb, cost_str = "solver new identity", "cost=n/a"
+
+            active_member = max(
+                (mm for mm in cl["members"] if mm.track_ref is not None and not mm.dead),
+                key=lambda mm: mm.last_visible, default=None,
+            )
+            if active_member is not None:
+                entry.active_tid = active_member.tid
+                self._tid_to_gid[active_member.tid] = gid
+
+            for mm in cl["members"]:
+                # Release a stale provisional claim on the OLD gid this
+                # member fast-committed to, if the solver landed somewhere
+                # else - otherwise that identity stays falsely "claimed" by
+                # a track_id that no longer uses it, blocking a legitimate
+                # future match to it. Its centroid was never touched by this
+                # member (add_evidence was deferred, see _try_fast_commit),
+                # so no rollback is needed there.
+                was_provisional = mm.provisional_gid is not None
+                confirmed = was_provisional and mm.provisional_gid == gid
+                corrected = was_provisional and mm.provisional_gid != gid
+                if corrected:
+                    old_entry = self._gallery.get(mm.provisional_gid)
+                    if old_entry is not None and old_entry.active_tid == mm.tid:
+                        old_entry.active_tid = None
+
+                if mm.track_ref is not None:
+                    mm.track_ref.t_global_id = gid
+                    if not confirmed:
+                        # A brand-new resolution, or a correction of a wrong
+                        # provisional guess - identity age starts now. A
+                        # confirm leaves it alone: the identity was actually
+                        # right since the original fast-commit frame.
+                        mm.track_ref.t_identity_since_frame = frame_id
+                    resolved.append(mm.track_ref)
+
+                if corrected:
+                    print(f"[GTA] fast-commit corrected: track={mm.tid} "
+                          f"provisional_gid={mm.provisional_gid} -> global_id={gid}")
+
+            print(f"[GTA] {verb}: tracks={tids} -> global_id={gid} ({cost_str})")
+
+        self._pending.clear()
+        self._gallery_dirty = True
+        return resolved
+
+    def _register(self, feats: dict, frame_id: int, bbox: Optional[np.ndarray], cam_source=None) -> int:
+        gid = self._next_gid
+        self._next_gid += 1
+        self._gallery[gid] = GalleryEntry(gid, feats, frame_id, bbox, ema_alpha=self.ema_alpha, cam_source=cam_source)
+        return gid
+
+    def _rebuild_fast_index(self) -> None:
+        gids = [g for g, e in self._gallery.items() if self._primary_stream in e.centroids]
+        if not gids:
+            self._fast_index = None
+            self._fast_index_gids = []
+            return
+        dim = self._gallery[gids[0]].centroids[self._primary_stream].shape[-1]
+        if self._fast_index is None or self._fast_index_dim != dim:
+            cpu_index = faiss.IndexFlatIP(dim)
+            idx = cpu_index
+            if self._use_gpu:
+                try:
+                    res = faiss.StandardGpuResources()
+                    idx = faiss.index_cpu_to_gpu(res, 0, cpu_index)
+                except Exception as exc:
+                    print(f"[GTA] GPU FAISS unavailable ({exc}); using CPU index")
+            self._fast_index = idx
+            self._fast_index_dim = dim
+        else:
+            self._fast_index.reset()
+        centroids = np.ascontiguousarray(
+            np.stack([self._gallery[g].centroids[self._primary_stream] for g in gids], axis=0).astype(np.float32)
+        )
+        self._fast_index.add(centroids)
+        self._fast_index_gids = gids
+
+    def _refresh_confusion_zones(self, frame_id: int) -> None:
+        "periodic dbscan"
+        if frame_id - self._last_confusion_refresh < self.confusion_refresh_interval:
+            return
+        self._last_confusion_refresh = frame_id
+        entries_with_primary = {g: e for g, e in self._gallery.items() if self._primary_stream in e.centroids}
+        if len(entries_with_primary) < 2:
+            self._confusion_gids = set()
+            return
+        gids = list(entries_with_primary.keys())
+        vecs = np.stack([entries_with_primary[g].centroids[self._primary_stream] for g in gids])
+        cos_dist = (1.0 - (vecs @ vecs.T)).clip(0.0, 2.0).astype(np.float64)
+        labels = DBSCAN(eps=self.confusion_eps, min_samples=2, metric='precomputed').fit_predict(cos_dist)
+        prev = self._confusion_gids
+        self._confusion_gids = {gids[i] for i, lbl in enumerate(labels) if lbl >= 0}
+        if self._confusion_gids != prev:
+            print(f"[GTA] confusion zones updated: {len(self._confusion_gids)} entries "
+                  f"gids={sorted(self._confusion_gids)}")
+
+
+    def deactivate_track(self, track_id: int) -> None:
+        self._tid_cooldown.pop(track_id, None)
+        ev = self._pending.get(track_id)
+        if ev is not None:
+            ev.dead = True
+            ev.track_ref = None
+        gid = self._tid_to_gid.pop(track_id, None)
+        if gid is None:
+            return
+        entry = self._gallery.get(gid)
+        if entry is not None and entry.active_tid == track_id:
+            entry.active_tid = None
 
     def _log_worker(self):
         buffer: list = []
@@ -447,22 +948,19 @@ class GTA:
                 f.write(json.dumps(line) + "\n")
 
     def stop_logging(self):
-        """Signal the background writer to finish and wait for it to exit. Call
-        at pipeline shutdown to guarantee all queued ticks are written."""
         if self._log_thread is None:
             return
         self._log_stop.set()
         self._log_thread.join(timeout=15)
         self._log_thread = None
 
-    # --- introspection -------------------------------------------------------
-
-    def get_all_clusters(self) -> list:
-        return list(self._clusters.values())
+    def get_gallery_entries(self) -> list:
+        return list(self._gallery.values())
 
     def size(self) -> int:
-        return len(self._clusters)
+        return len(self._gallery)
 
     def __repr__(self):
-        return (f"GTA(clusters={len(self._clusters)}, nodes={len(self._nodes)}, "
-                f"window_frames={self.window_frames})")
+        active = sum(1 for e in self._gallery.values() if e.active_tid is not None)
+        return (f"GTA(identities={len(self._gallery)}, active={active}, "
+                f"pending={len(self._pending)}, streams={list(self._stream_cfg.keys())})")

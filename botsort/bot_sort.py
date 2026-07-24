@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 from collections import deque
+from typing import Optional
 
 from . import matching
 
@@ -21,6 +22,10 @@ class ID_Assigner:
 class STrack(BaseTrack):
     shared_kalman = KalmanFilter()
 
+    # Stream key used when `feat` is passed as a single array rather than a
+    # dict of {model_name: embedding} - the common single-ReID-model case.
+    _DEFAULT_STREAM = "primary"
+
     def __init__(self, tlwh, score, feat=None, obj_meta = None, pose=None, num_kpts=0, img_path=None, feat_history=50):
 
         # wait activate
@@ -33,14 +38,25 @@ class STrack(BaseTrack):
         self.score = score
         self.tracklet_len = 0
 
-        self.smooth_feat = None
-        self.curr_feat = None
+        # One EMA-smoothed / one raw-latest embedding per named ReID stream
+        # (e.g. {"reidnet": ..., "clipreid": ...} when multiple SGIEs feed
+        # this tracklet - see ds_global_tracklet_association.py). Whichever
+        # stream name is inserted first becomes the "primary" stream:
+        # self.smooth_feat/self.curr_feat below stay plain-ndarray aliases
+        # for it, so BoT-SORT's own short-term IOU+embedding association
+        # (matching.py's embedding_distance) keeps reading a single vector,
+        # unaffected by a second model being carried through. The
+        # cross-camera tracklet-level engine (global_tracklet_association.py)
+        # is the one consumer that reads the full smooth_feats dict.
+        self.smooth_feats: dict = {}
+        self.curr_feats: dict = {}
+        self._primary_stream: Optional[str] = None
         self.pose = pose
         self.num_kpts = num_kpts
         self.img_path = img_path
+        self.alpha = 0.9
         if feat is not None:
             self.update_features(feat)
-        self.alpha = 0.9
 
         self.centroid = np.asarray(self._tlwh[:2] + self._tlwh[2:] / 2, dtype=np.float64)
         self.t_global_id = 0
@@ -57,17 +73,43 @@ class STrack(BaseTrack):
         self.matched_dist = None
 
     def update_features(self, feat, det_confidence=1.0):
-        feat /= np.linalg.norm(feat)
-        self.curr_feat = feat
-        if self.smooth_feat is None:
-            self.smooth_feat = feat
-        else:
-            # Low detection confidence (partial occlusion, blur) → scale down
-            # the new-observation weight so occluded frames drift the EMA less.
-            # effective_alpha approaches 1.0 (freeze) as det_confidence → 0.
-            effective_alpha = self.alpha + (1.0 - self.alpha) * (1.0 - float(det_confidence))
-            self.smooth_feat = effective_alpha * self.smooth_feat + (1.0 - effective_alpha) * feat
-        self.smooth_feat /= np.linalg.norm(self.smooth_feat)
+        """Update this tracklet's per-stream EMA feature(s).
+
+        `feat` is either a single embedding (np.ndarray) - stored under the
+        implicit `_DEFAULT_STREAM` key - or a dict of {stream_name: embedding}
+        when multiple ReID models feed this tracklet. Each stream gets its own
+        independent EMA, identical in shape to the original single-model
+        logic (confidence-weighted alpha, unit-renormalized after blending).
+        """
+        streams = feat if isinstance(feat, dict) else {self._DEFAULT_STREAM: feat}
+        for name, vec in streams.items():
+            if vec is None:
+                continue
+            vec = np.asarray(vec, dtype=np.float32)
+            n = np.linalg.norm(vec)
+            vec = (vec / n) if n > 1e-9 else vec
+            self.curr_feats[name] = vec
+            prev = self.smooth_feats.get(name)
+            if prev is None:
+                self.smooth_feats[name] = vec
+            else:
+                # Low detection confidence (partial occlusion, blur) → scale down
+                # the new-observation weight so occluded frames drift the EMA less.
+                # effective_alpha approaches 1.0 (freeze) as det_confidence → 0.
+                effective_alpha = self.alpha + (1.0 - self.alpha) * (1.0 - float(det_confidence))
+                blended = effective_alpha * prev + (1.0 - effective_alpha) * vec
+                bn = np.linalg.norm(blended)
+                self.smooth_feats[name] = (blended / bn) if bn > 1e-9 else blended
+            if self._primary_stream is None:
+                self._primary_stream = name
+
+    @property
+    def smooth_feat(self):
+        return self.smooth_feats.get(self._primary_stream) if self._primary_stream is not None else None
+
+    @property
+    def curr_feat(self):
+        return self.curr_feats.get(self._primary_stream) if self._primary_stream is not None else None
 
     def predict(self):
         mean_state = self.mean.copy()
@@ -110,8 +152,12 @@ class STrack(BaseTrack):
 
     def re_activate(self, new_track, frame_id, new_id=False, id_assigner=None):
         self.mean, self.covariance = self.kalman_filter.update(self.mean, self.covariance, self.tlwh_to_xywh(new_track.tlwh))
-        if new_track.curr_feat is not None:
-            self.update_features(new_track.curr_feat, det_confidence=new_track.score)
+        if new_track.curr_feats:
+            # Forward every stream the new detection carries (not just the
+            # primary-stream curr_feat alias) so a second ReID model's
+            # embedding keeps flowing into this tracklet's EMA after the
+            # first frame too.
+            self.update_features(new_track.curr_feats, det_confidence=new_track.score)
         self.tracklet_len = 0
         self.state = TrackState.Tracked
         self.is_activated = True
@@ -151,9 +197,11 @@ class STrack(BaseTrack):
 
         ''' only suitable for reid wrapper '''
         # if new_track.curr_feat is not None and not new_track.is_touching_edge:
-            
-        if new_track.curr_feat is not None:
-            self.update_features(new_track.curr_feat, det_confidence=new_track.score)
+
+        if new_track.curr_feats:
+            # See re_activate()'s comment - forward every stream, not just
+            # the primary-stream alias.
+            self.update_features(new_track.curr_feats, det_confidence=new_track.score)
 
         self.state = TrackState.Tracked
         self.is_activated = True
@@ -312,7 +360,17 @@ class BoTSORT(object):
             scores = np.array([d['det_confidence'] for d in output_results])
             bboxes = np.array([d['bbox'] for d in output_results])
             classes = np.array([1 for d in output_results])
-            features = np.array([d['reid_vector'] for d in output_results])
+            # 'reid_vectors' (dict[str, np.ndarray], one entry per ReID model
+            # - see ds_global_tracklet_association.py's probe) takes priority
+            # over the legacy single-model 'reid_vector' key so a caller
+            # feeding multiple SGIEs' embeddings straight through to
+            # STrack(feat=...) - which accepts either shape, see
+            # update_features - just works. dtype=object: elements are
+            # ndarrays/dicts/None, not a numeric matrix numpy could stack.
+            features = np.array(
+                [d.get('reid_vectors', d.get('reid_vector')) for d in output_results],
+                dtype=object,
+            )
             obj_meta = np.array([d['obj_meta'] for d in output_results])
 
             # Remove bad detections

@@ -1,8 +1,9 @@
 source-list:
   # list: file:///home/lakshh/Downloads/output_h264_trim.mp4;
-  # list: rtsp://root:root@192.168.6.92/cam1/h264;rtsp://admin:123456@192.168.6.91/stream0
+  # list: rtsp://root:root@192.168.6.92/cam1/h264;rtsp://root:root@192.168.6.91/cam1/h264
+  list: file:///home/lakshh/workspace/fire_smoke/research/captures/rtsp0_20260724_194439.mp4;file:///home/lakshh/workspace/fire_smoke/research/captures/rtsp1_20260724_194439.mp4
   # list: v4l2:///dev/video0
-  list: file:///home/lakshh/workspace/reid/datasets/2247f442a9784b5c959e7bead89c0313_V2/CHIRLA_dataset/videos/seq_026/cam_4.avi;file:///home/lakshh/workspace/reid/datasets/2247f442a9784b5c959e7bead89c0313_V2/CHIRLA_dataset/videos/seq_026/cam_2.avi
+  # list: file:///home/lakshh/workspace/reid/datasets/2247f442a9784b5c959e7bead89c0313_V2/CHIRLA_dataset/videos/seq_026/cam_4.avi;file:///home/lakshh/workspace/reid/datasets/2247f442a9784b5c959e7bead89c0313_V2/CHIRLA_dataset/videos/seq_026/cam_2.avi
   # list: file:///home/lakshh/workspace/fire_smoke/research/captures/rtsp0_20260715_140145.mp4;file:///home/lakshh/workspace/fire_smoke/research/captures/cam3_20260715_140145.mp4
   # list: 
   # list: v4l2:///dev/video3
@@ -30,7 +31,19 @@ primary-gie:
 
 secondary-gie-1:
   plugin-type: 0
+  # ReIdentificationNet (gie-unique-id: 2 -> "reidnet" stream, see
+  # ds_global_tracklet_association.py's GIE_STREAM_NAMES). Runs first in the
+  # chain and is the primary stream for BoT-SORT's own short-term
+  # association and GTA's fast-commit path.
   config-file-path: /home/lakshh/workspace/reid/impl_bot/bot_sort_ds_impl/ds_include/sgie_config.yml
+
+secondary-gie-2:
+  plugin-type: 0
+  # CLIP-ReID ViT-B/16 (gie-unique-id: 3 -> "clipreid" stream). Runs
+  # alongside secondary-gie-1, not instead of it - both now feed the
+  # cross-camera GTA engine's per-model fusion (see the module docstring in
+  # botsort/global_tracklet_association.py).
+  config-file-path: /home/lakshh/workspace/reid/impl_bot/bot_sort_ds_impl/ds_include/sgie_config_clipreid.yml
 
 # tracker:
 #   enable: 0

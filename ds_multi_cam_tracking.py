@@ -35,6 +35,21 @@ FRAME_W          = 1920
 FRAME_H          = 1080
 BOUNDARY_MARGIN  = 20   # pixels — edge-of-frame margin for is_touching_edge / ROI lines
 
+# nvinfer gie-unique-id -> stream name, same mapping as
+# ds_global_tracklet_association.py's GIE_STREAM_NAMES (must match
+# ds_include/sgie_config.yml's gie-unique-id=2 and
+# ds_include/sgie_config_clipreid.yml's gie-unique-id=3). This pipeline only
+# ever wires ONE secondary-gie - main()'s pipeline construction below reads
+# app_config.yml's secondary-gie-2 (clipreid) specifically, not
+# secondary-gie-1 (reidnet), to match this file's GlobalRegistry(emb_dim=1280)
+# below - unlike ds_global_tracklet_association.py, no sgie2 element/GTA's
+# dual-model fusion is wired here (see that constructor's comment for why).
+# reid_vectors will only ever have one entry, but keying it by gie-unique-id
+# rather than "whichever tensor meta is found first" still matters: it's
+# what guarantees GlobalRegistry gets the CLIPREID vector specifically, not
+# whichever model's meta happens to attach first.
+GIE_STREAM_NAMES = {2: "reidnet", 3: "clipreid"}
+
 # --- optional CHIRLA ground-truth evaluation hook -----------------------
 # Off by default (--check_tracking_accuracy) so normal interactive runs
 # (display sink, looping perf mode) are untouched. When on, the ground
@@ -92,6 +107,12 @@ registry = GlobalRegistry(
     reid_log_path="./reid_norm_log.jsonl",
     match_threshold=0.5,
     min_frames=30,
+    # CLIP-ReID (ViT-B/16, see export_clipreid_onnx.py /
+    # ds_include/sgie_config_clipreid.yml) produces a 1280-d embedding
+    # (768-d CLS token + 512-d CLIP-projected CLS token, concatenated) -
+    # explicit here so a mismatched SGIE swap fails fast with a clear error
+    # instead of silently building a wrongly-sized FAISS index.
+    emb_dim=1280,
 )
 
 tracker1 = BoTSORT(
@@ -262,7 +283,9 @@ def reid_pad_buffer_probe(pad, info, u_data):
             obj_meta.rect_params.border_color.set(0.0, 0.0, 1.0, 1.0)
             obj_meta.rect_params.border_width = 1
             obj_meta.text_params.display_text = ""
-            reid_vector = None
+            # Keyed by stream name (GIE_STREAM_NAMES), not "whichever tensor
+            # meta is found first" - see the constant's comment above.
+            reid_vectors = {}
 
             nvtx.push_range("reid_extract", color="yellow")
             l_user = obj_meta.obj_user_meta_list
@@ -274,14 +297,16 @@ def reid_pad_buffer_probe(pad, info, u_data):
 
                 if user_meta.base_meta.meta_type == pyds.NvDsMetaType.NVDSINFER_TENSOR_OUTPUT_META:
                     tensor_meta = pyds.NvDsInferTensorMeta.cast(user_meta.user_meta_data)
-                    layer = pyds.get_nvds_LayerInfo(tensor_meta, 0)
-                    ptr = ctypes.cast(pyds.get_ptr(layer.buffer), ctypes.POINTER(ctypes.c_float))
+                    stream_name = GIE_STREAM_NAMES.get(tensor_meta.unique_id)
+                    if stream_name is not None:
+                        layer = pyds.get_nvds_LayerInfo(tensor_meta, 0)
+                        ptr = ctypes.cast(pyds.get_ptr(layer.buffer), ctypes.POINTER(ctypes.c_float))
 
-                    embed_len = 1
-                    for i in range(layer.inferDims.numDims):
-                        embed_len *= layer.inferDims.d[i]
+                        embed_len = 1
+                        for i in range(layer.inferDims.numDims):
+                            embed_len *= layer.inferDims.d[i]
 
-                    reid_vector = np.copy(np.ctypeslib.as_array(ptr, shape=(embed_len,)))
+                        reid_vectors[stream_name] = np.copy(np.ctypeslib.as_array(ptr, shape=(embed_len,)))
 
                 l_user = l_user.next
             nvtx.pop_range()  # reid_extract
@@ -303,7 +328,7 @@ def reid_pad_buffer_probe(pad, info, u_data):
                 "det_confidence": obj_meta.confidence,
                 # change @BOTSORT if touching_edge, track using IOU but dont input anymore reidentification_features
                 "obj_meta": is_touching_edge,
-                "reid_vector": reid_vector
+                "reid_vectors": reid_vectors,
             })
 
             l_obj = l_obj.next
@@ -716,7 +741,13 @@ def main():
     if pgie_config_path:
         pgie.set_property('config-file-path', pgie_config_path)
 
-    sgie1_config = config.get('secondary-gie-1', {})
+    # secondary-gie-2, not -1: app_config.yml is shared with
+    # ds_global_tracklet_association.py, where secondary-gie-1/-2 mean
+    # "reidnet"/"clipreid" respectively (see GIE_STREAM_NAMES above). This
+    # file's GlobalRegistry is hardcoded for clipreid's 1280-d embedding
+    # (emb_dim=1280 below), so it must read the clipreid slot specifically,
+    # not "whichever config happens to sit in secondary-gie-1".
+    sgie1_config = config.get('secondary-gie-2', {})
     sgie1_config_path = sgie1_config.get('config-file') or sgie1_config.get('config-file-path')
     if sgie1_config_path:
         sgie1.set_property('config-file-path', sgie1_config_path)

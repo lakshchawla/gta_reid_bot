@@ -1,0 +1,134 @@
+GTA identity-shift investigation — what's actually going on
+=============================================================
+Dataset: CHIRLA seq_026, cam_2 + cam_4, ~7755 frames (~258s @ 30fps)
+Ground truth: 9 distinct real people across both cameras (ids 2,3,5,6,7,9,10,11,14)
+
+
+SHORT VERSION
+-------------
+It is not "ID shifts" in the sense the CHIRLA `shifts` metric measures (a live
+track's global_id flipping to a different real identity while still on
+screen) — that metric reads 0 in every run below. The real problem is
+FRAGMENTATION: the same real person keeps getting handed a brand-new identity
+number instead of being re-linked to their own earlier one. 9 real people
+ended up as 17-29 GTA identities depending on configuration, and no amount of
+parameter tuning tried here got anywhere close to 9. That's the signal that
+this needs an architectural fix (the GAEC-over-GlobalRegistry overlay already
+sketched in the working plan), not just better numbers.
+
+
+WHY THE `shifts` METRIC READS 0 DESPITE VISIBLE CHURN
+------------------------------------------------------
+Every GTA run logs lines like:
+
+    [GTA] identity split: old_id=6 kept_tids=[2019, 1013] split_off=[(9, [2011])]
+
+— meaning tracklet 2011 was wrongly grouped into identity 6, and a later tick
+corrected it, giving it identity 9 instead. That is a real correction, but by
+the time it happens, tracklet 2011 has usually already ended (it's not in
+anyone's `tracked_stracks` anymore). CHIRLA's `_compute_shifts`
+(evaluate_tracking.py:303) only walks the history built by `add_prediction()`,
+which is only called for a track while it is CURRENTLY live and on screen
+(see the probe callback in ds_global_tracklet_association.py). A correction
+applied to an already-closed tracklet never appears in that history, so it
+can never register as a "shift" — the metric is structurally blind to this
+failure mode, not because nothing is wrong, but because it only watches one
+specific way things can go wrong (a live label flipping), and this isn't that.
+
+The `reid_accuracy` and `query_accuracy` metrics are similarly poor witnesses
+here, for a different reason: both explicitly exclude "unassigned"
+predictions (t_global_id == 0, shown as "?") from scoring
+(evaluate_tracking.py:212, :240 — `if g != self.unassigned_id`). A tracklet
+that never gets a global_id, or a brand-new tracklet that mints a fresh id
+instead of correctly re-joining an existing one, still scores as "correct"
+in reid_accuracy — because once minted, its own new id gets its own
+self-consistent majority-vote mapping to the right real person and stays
+that way. Fragmentation is close to invisible to these three metrics by
+construction. The only metric that actually exposes it is:
+
+    (number of GTA identities ever minted) vs (9 real people)
+
+
+TUNING EXPERIMENTS RUN
+-----------------------
+Three configurations were run end-to-end against this same clip. In all
+three, `shifts=0` and reid_accuracy/query_accuracy look "good" or "excellent"
+— exactly the misleading signal described above. The identity count is the
+column that actually matters:
+
+  Config | window_frames | min_tracklet_len | mu_gap_sec | sigma_gap_sec | link_threshold | final identities | GTA split events | reid_accuracy | query_accuracy
+  -------|---------------|------------------|------------|---------------|----------------|------------------|------------------|----------------|----------------
+  A      | 600  (20s)    | 10  (~0.3s)      | 2.0 (def)  | 20.0 (def)    | -6.0 (def)     | 17               | 10               | 0.9693         | 0.9259
+  B      | 1800 (60s)    | 30  (1s)         | 2.0 (def)  | 20.0 (def)    | -6.0 (def)     | 28               | 1                | 0.9988         | 1.0000
+  C      | 900  (30s)    | 20  (~0.7s)      | 3.0        | 10.0          | -5.0           | 29               | 4                | 0.9992         | 1.0000
+
+  (true answer: 9 identities)
+
+Reading this table straight would suggest B or C are "better" (near-perfect
+accuracy, almost no churn). They are not better — they are WORSE at the
+actual job (17 -> 28 -> 29 identities, moving further from 9), just less
+visibly wrong on metrics that don't penalize minting a new id instead of
+reusing an old one. What longer windows / stricter tracklet-length actually
+do is exclude more short/borderline tracklets from ever being scored or
+attempted at all (fewer, cleaner decisions, each less likely to need
+correcting later) — at the cost of also linking fewer genuine same-person
+reappearances, so more brand-new identities get minted overall. Config A's
+shorter window (more ticks = more chances across the video to reconcile
+someone's later reappearance with their earlier tracklet) is directionally
+closer to right despite its higher per-tick churn, so it's the one left
+configured in ds_global_tracklet_association.py after this pass. It is still
+2x over-fragmented (17 vs 9) — a "least bad" choice, not a fix.
+
+Tightening the time prior (Config C: mu_gap_sec=3.0, sigma_gap_sec=10.0
+instead of the loose 2.0/20.0 default) did not help and if anything made
+fragmentation slightly worse. That's consistent with the earlier finding
+that, without real per-camera-pair calibration data, any single global
+Gaussian gap prior is a guess — tightening it just changes WHICH plausible
+reappearances get penalized, it doesn't add real discriminating signal.
+
+
+WHY TUNING ALONE ISN'T GOING TO CLOSE THIS GAP
+------------------------------------------------
+GTA's identity decision is effectively cosine-similarity-by-log-likelihood
+plus a mostly-uninformative time term (see the conversation this session
+that led to the GAEC rewrite) — there's no per-camera-pair transit-time
+calibration, and every tick reconverges the ENTIRE tracklet graph from
+scratch. That combination means:
+
+  - A genuinely-same person reappearing after a longer-than-window gap, or
+    with even mild appearance drift (lighting, pose, partial occlusion),
+    frequently fails to clear the aggregate bar against their own earlier
+    tracklet and mints a new identity instead - fragmentation.
+  - Occasionally two different people DO clear that bar together (a
+    look-alike, or two short/noisy tracklets with too little evidence),
+    producing a wrong merge that a later tick's full recompute then
+    corrects (the `[GTA] identity split: ...]` log lines) - but usually
+    too late to matter, since the affected tracklet has already ended.
+
+No combination of window_frames / min_tracklet_len / sigma_feat / sigma_gap_sec
+changes that underlying reality - they only trade which of the two failure
+modes (fragmentation vs. wrong-merge-then-correct) is more visible, and by how
+much scoring exclusion flatters the metrics. This is exactly why the plan
+file's next phase - a GAEC layer reconverging over GlobalRegistry's own
+already-cleaned, committed identities (outlier-rejected, occlusion-aware,
+confusion-zone-checked) rather than raw per-tick tracklet evidence, with an
+asymmetric threshold that makes it hard to overturn an existing commit but
+easy to form one - is the real fix being planned, not a further round of
+parameter search on the current model.
+
+
+WHAT TO TAKE AWAY
+------------------
+1. "shifts=0" in any of these runs does not mean the association is working
+   well. It means this specific metric cannot see the failure mode actually
+   present (fragmentation of already-closed tracklets), only a different one
+   (a live track's label flipping).
+2. The only trustworthy number in this whole investigation is the identity
+   count vs. the known 9 real people. Every configuration tried landed
+   between 1.9x and 3.2x over-fragmented.
+3. Config A (window_frames=600, min_tracklet_len=10 - the values currently
+   left in ds_global_tracklet_association.py) is kept as the least-bad of the
+   three tried, not because it's good.
+4. The durable fix is architectural (GAEC-over-GlobalRegistry, already
+   spec'd in the working plan file), not further tuning of GTA's current
+   from-scratch-every-tick, single-Gaussian-time-prior design.

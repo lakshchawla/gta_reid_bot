@@ -18,7 +18,12 @@ property:
   operate-on-class-ids: 0
   scaling-compute-hw: 1
   gie-unique-id: 2
-  
+  # See the matching comment in sgie_config_clipreid.yml (gie-unique-id: 3) -
+  # both secondary GIEs now run in the same pipeline (app_config.yml's
+  # secondary-gie-1/secondary-gie-2), each attaching output to the same
+  # pgie-created objects.
+  operate-on-gie-id: 1
+
 
 
 # property:

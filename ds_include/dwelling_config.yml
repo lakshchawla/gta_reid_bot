@@ -1,0 +1,14 @@
+dwelling:
+  enabled: true
+  threshold-sec: 60.0
+  recency-window-sec: 30.0
+  re-alert-interval-sec: 30.0
+  severity-levels:
+    - name: WARNING
+      multiplier: 1.0     # >= threshold-sec (10 min by default)
+    - name: CRITICAL
+      multiplier: 2.0     # >= 2x threshold-sec (20 min by default)
+
+logging:
+  console: true
+  log-path: "./dwelling_alerts.jsonl"

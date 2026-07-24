@@ -26,14 +26,50 @@ if path_to_botsort_parent not in sys.path:
     sys.path.append(path_to_botsort_parent)
 
 from botsort.bot_sort import BoTSORT
-from botsort.global_tracklet_association import GTA
+from botsort.global_tracklet_association import GTA, FeatureStreamConfig
 from botsort.multi_camera_tracker import MultiCameraTracker
+from botsort.tracklet_integrity import TrackletIntegrityChecker
+from botsort.dwelling import load_dwelling_config
 from evaluate_tracking import EvaluateTracking
 
 
 FRAME_W          = 1920
 FRAME_H          = 1080
 BOUNDARY_MARGIN  = 20   # pixels — edge-of-frame margin for is_touching_edge / ROI lines
+PEOPLENET_GIE_ID = 1    # [PGIE] gie-unique-id: PeopleNet person detector (ds_include/dstest3_pgie_config.yml)
+
+# --- Testing knob: which SGIE(s) actually run this pipeline -------------
+# Hardcoded here (not app_config.yml) - this is for local dev/testing, flip
+# freely without touching the shared DS config. Each entry names one
+# optional secondary-gie; SGIE_DEFS below maps it to its gie-unique-id,
+# app_config.yml key, and element name. The FIRST entry becomes GTA's
+# primary stream (see the streams= construction below) - the one BoT-SORT's
+# own short-term association (matching.py's embedding_distance, via
+# STrack.smooth_feat/curr_feat) and GTA's fast-commit path consult - so
+# running with just one model still gets a fully working primary stream,
+# whichever it is.
+#   ["reidnet"]              -> ReIdentificationNet only
+#   ["clipreid"]             -> CLIP-ReID only
+#   ["reidnet", "clipreid"]  -> both, fused (see the module docstring in
+#                               botsort/global_tracklet_association.py)
+ACTIVE_SGIES = ["reidnet", "clipreid"]
+
+SGIE_DEFS = {
+    "reidnet":  {"gie_id": 2, "config_key": "secondary-gie-1", "element": "secondary-nvinference-engine-1"},
+    "clipreid": {"gie_id": 3, "config_key": "secondary-gie-2", "element": "secondary-nvinference-engine-2"},
+}
+if not ACTIVE_SGIES:
+    sys.exit("ACTIVE_SGIES is empty - GTA needs at least one ReID stream to run.")
+if any(name not in SGIE_DEFS for name in ACTIVE_SGIES):
+    sys.exit(f"ACTIVE_SGIES must be a subset of {list(SGIE_DEFS)}, got {ACTIVE_SGIES}.")
+
+# nvinfer gie-unique-id -> the STrack.smooth_feats stream name that model's
+# embedding is stored under (see botsort/bot_sort.py's STrack.update_features
+# and botsort/global_tracklet_association.py's FeatureStreamConfig). Derived
+# from ACTIVE_SGIES so a disabled SGIE's tensor meta (which will simply never
+# appear, since its nvinfer element isn't in the pipeline) has no stream name
+# to accidentally collide with.
+GIE_STREAM_NAMES = {SGIE_DEFS[name]["gie_id"]: name for name in ACTIVE_SGIES}
 
 # --- optional CHIRLA ground-truth evaluation hook -----------------------
 # Off by default (--check_tracking_accuracy) so normal interactive runs
@@ -53,11 +89,6 @@ CHIRLA_EVAL_MODE      = False   # set from --check_tracking_accuracy in main()
 _chirla_eval           = None   # EvaluateTracking instance, built in main() when enabled
 _chirla_source_to_cam  = {}     # DS source_id -> CHIRLA camera number, built in main()
 
-# Root directory for per-identity gallery snapshots. Must already exist
-# (can be empty); sub-directories named by the *raw* (un-namespaced)
-# global_id are created on demand - a re-id match from either camera lands
-# in the same folder, since that's the entire point of cross-camera GTA
-# (one folder per real person, regardless of which camera saw them).
 GALLERY_DIR = os.environ.get("GALLERY_DIR", "./gallery_snapshots")
 os.makedirs(GALLERY_DIR, exist_ok=True)
 
@@ -90,9 +121,42 @@ def save_global_id_crop(output_dir, global_id, frame_bgr, bbox_tlwh, frame_id, t
 
 gta = GTA(
     reid_log_path="./gta_log.jsonl",
-    window_frames=600,
-    min_tracklet_len=30,
+    solver_interval_frames=600,
+    min_tracklet_len=10,
+    # One independently-calibrated stream per entry in ACTIVE_SGIES, fused
+    # via late, per-stream-weighted log-likelihood combination - not vector
+    # concatenation (see the module docstring in
+    # botsort/global_tracklet_association.py for why). The FIRST ACTIVE_SGIES
+    # entry is marked primary regardless of which model that is - see
+    # ACTIVE_SGIES' comment above. Weights/sigma_feat here are starting
+    # points, not calibrated (same posture every threshold in this codebase
+    # already takes) - clipreid's 1280-d embedding (768-d CLS + 512-d
+    # CLIP-projected CLS, see export_clipreid_onnx.py) is a different feature
+    # space than reidnet's 2048-d, so each keeps its own independent
+    # sigma_feat/outlier_reject_thresh, never compared directly against the
+    # other's.
+    streams=[
+        FeatureStreamConfig(name=name, weight=1.0, sigma_feat=0.15,
+                             outlier_reject_thresh=0.30, is_primary=(name == ACTIVE_SGIES[0]))
+        for name in ACTIVE_SGIES
+    ],
 )
+
+# Watches each camera's live tracks' raw per-frame embeddings for a bimodal
+# swap (BoT-SORT's own IOU association silently handing a track_id to a
+# different person under occlusion) and splits the tracklet at the
+# changepoint before either camera's evidence reaches `gta` - see
+# botsort/tracklet_integrity.py. Independent of GTA/GlobalRegistry; only
+# needs deactivate_track(), which both already expose.
+tracklet_integrity = TrackletIntegrityChecker()
+
+# Per-camera person-dwelling (loitering) detection, driven straight off each
+# tick's mct.update_batch() results - see botsort/dwelling.py's module
+# docstring for why the dwell clock is scoped per camera, not station-wide,
+# and ds_include/dwelling_config.yml for the tunable thresholds. None if
+# dwelling.enabled is false in that config - every call site below already
+# guards on that.
+dwelling_monitor = load_dwelling_config("ds_include/dwelling_config.yml", frame_rate=30.0)
 
 tracker1 = BoTSORT(
     cam_source=1,
@@ -187,7 +251,25 @@ def decodebin_child_added(child_proxy, Object, name, user_data):
     if name.find("decodebin") != -1:
         Object.connect("child-added", decodebin_child_added, user_data)
     if "source" in name:
-        Object.set_property("drop-on-latency", True)
+        # protocols=4 (TCP only): an rtspsrc stalls on connect if left to
+        # auto-negotiate (tries UDP first, only falls back to TCP after a
+        # timeout per source) - forcing TCP skips straight to the transport
+        # that actually connects. No-op for the file:// sources this project
+        # currently uses (rtspsrc's own property, absent on filesrc/etc.),
+        # kept for whenever this pipeline is pointed at real cameras - see
+        # DSMetroPerception_py/src/pipeline/main_multi.py, the reference this
+        # mirrors.
+        if Object.find_property("protocols"):
+            Object.set_property("protocols", 4)
+        if Object.find_property("latency"):
+            Object.set_property("latency", 300)
+        # drop-on-latency: let the jitterbuffer drop stale packets once past
+        # its latency window instead of holding/replaying them late - without
+        # this, a momentary GPU stall accumulates as growing lag that never
+        # recovers on a live feed (data keeps arriving in real time
+        # regardless of how far behind the pipeline falls).
+        if Object.find_property("drop-on-latency"):
+            Object.set_property("drop-on-latency", True)
 
 def create_source_bin(index, uri):
     sys.stdout.write(f"{uri}\n")
@@ -262,7 +344,14 @@ def reid_pad_buffer_probe(pad, info, u_data):
             obj_meta.rect_params.border_color.set(0.0, 0.0, 1.0, 1.0)
             obj_meta.rect_params.border_width = 1
             obj_meta.text_params.display_text = ""
-            reid_vector = None
+            # One entry per SGIE that actually produced tensor output for
+            # this object this frame, keyed by stream name (GIE_STREAM_NAMES)
+            # - not just the first one found. With ACTIVE_SGIES=[..] chained
+            # (pgie -> each active nvinfer in order), each attaches its own
+            # NVDSINFER_TENSOR_OUTPUT_META to the SAME obj_meta, so a single
+            # reid_vector variable that gets overwritten would silently lose
+            # whichever model's output arrived first.
+            reid_vectors = {}
 
             nvtx.push_range("reid_extract", color="yellow")
             l_user = obj_meta.obj_user_meta_list
@@ -274,14 +363,16 @@ def reid_pad_buffer_probe(pad, info, u_data):
 
                 if user_meta.base_meta.meta_type == pyds.NvDsMetaType.NVDSINFER_TENSOR_OUTPUT_META:
                     tensor_meta = pyds.NvDsInferTensorMeta.cast(user_meta.user_meta_data)
-                    layer = pyds.get_nvds_LayerInfo(tensor_meta, 0)
-                    ptr = ctypes.cast(pyds.get_ptr(layer.buffer), ctypes.POINTER(ctypes.c_float))
+                    stream_name = GIE_STREAM_NAMES.get(tensor_meta.unique_id)
+                    if stream_name is not None:
+                        layer = pyds.get_nvds_LayerInfo(tensor_meta, 0)
+                        ptr = ctypes.cast(pyds.get_ptr(layer.buffer), ctypes.POINTER(ctypes.c_float))
 
-                    embed_len = 1
-                    for i in range(layer.inferDims.numDims):
-                        embed_len *= layer.inferDims.d[i]
+                        embed_len = 1
+                        for i in range(layer.inferDims.numDims):
+                            embed_len *= layer.inferDims.d[i]
 
-                    reid_vector = np.copy(np.ctypeslib.as_array(ptr, shape=(embed_len,)))
+                        reid_vectors[stream_name] = np.copy(np.ctypeslib.as_array(ptr, shape=(embed_len,)))
 
                 l_user = l_user.next
             nvtx.pop_range()  # reid_extract
@@ -303,7 +394,7 @@ def reid_pad_buffer_probe(pad, info, u_data):
                 "det_confidence": obj_meta.confidence,
                 # change @BOTSORT if touching_edge, track using IOU but dont input anymore reidentification_features
                 "obj_meta": is_touching_edge,
-                "reid_vector": reid_vector
+                "reid_vectors": reid_vectors,
             })
 
             l_obj = l_obj.next
@@ -317,14 +408,30 @@ def reid_pad_buffer_probe(pad, info, u_data):
         # update_batch() runs BoTSORT.update() for both cameras (once each,
         # for this whole batch tick) and then gta.step() for each - this single
         # shared GTA instance is what makes cross-camera Global Tracklet
-        # Association happen, see botsort/multi_camera_tracker.py. Identity is
-        # only ever decided once per gta.window_frames tick, from a tracklet's
-        # whole first->last visible span, not off this single call.
+        # Association happen, see botsort/multi_camera_tracker.py. A fresh
+        # identity decision is only ever made from a tracklet's whole
+        # accumulated evidence - either an immediate, conservative fast-commit
+        # or (the default path) the batch solver that runs once per
+        # gta.solver_interval_frames tick - never off this single call.
         # Both sources land in the same nvstreammux batch each tick here, so
         # one frame_num (from whichever source_id has a frame_meta this
         # batch) is representative for both.
         shared_frame_id = next(iter(frame_meta_by_source.values())).frame_num
         results = mct.update_batch(detections_by_source, frame_id=shared_frame_id)
+
+        # Per-frame (not per-tick) bimodality check on each camera's own live
+        # tracks, after this batch's BoTSORT.update() has run - see
+        # botsort/tracklet_integrity.py. Splits a silently-swapped track_id in
+        # place before its evidence ever reaches `gta`.
+        tracklet_integrity.observe(tracker1, shared_frame_id, registry=gta)
+        tracklet_integrity.observe(tracker2, shared_frame_id, registry=gta)
+
+        # Per-camera dwell-time bookkeeping, off this same tick's results -
+        # see botsort/dwelling.py. Cheap dict bookkeeping, no extra tracker
+        # work; alerts print/log on their own cadence (re-alert-interval-sec
+        # in ds_include/dwelling_config.yml), not every tick.
+        if dwelling_monitor is not None:
+            dwelling_monitor.update(results, shared_frame_id)
 
         # print(f"[DS] : {len(detections_by_source[0]), len(detections_by_source[1])}")
 
@@ -388,13 +495,21 @@ def reid_pad_buffer_probe(pad, info, u_data):
                 display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
                 slot = 0
 
+            is_dwelling = (dwelling_monitor is not None
+                           and dwelling_monitor.is_dwelling(source_id, t.t_global_id))
+
             rect_params = display_meta.rect_params[slot]
             rect_params.left = t.tlwh[0]
             rect_params.top = t.tlwh[1]
             rect_params.width = t.tlwh[2]
             rect_params.height = t.tlwh[3]
-            rect_params.border_width = 1
-            rect_params.border_color.set(0.0, 1.0, 0.0, 1.0)
+            rect_params.border_width = 3 if is_dwelling else 1
+            # Magenta while dwelling - distinct from the plain green box, so
+            # a loitering alert is visible on-screen, not just in the log.
+            if is_dwelling:
+                rect_params.border_color.set(1.0, 0.0, 1.0, 1.0)
+            else:
+                rect_params.border_color.set(0.0, 1.0, 0.0, 1.0)
             rect_params.has_bg_color = 0
 
             # Unified (un-namespaced) global_id on purpose: the whole point
@@ -412,9 +527,14 @@ def reid_pad_buffer_probe(pad, info, u_data):
                 age_s = max(0, frame_meta.frame_num - t.t_identity_since_frame) / 30.0
                 age_label = f" | {age_s:.0f}s"
 
+            dwell_label = ""
+            if is_dwelling:
+                mins = dwelling_monitor.dwell_seconds(source_id, t.t_global_id) / 60.0
+                dwell_label = f" | DWELL({dwelling_monitor.severity(source_id, t.t_global_id)}) {mins:.0f}m"
+
             text_params = display_meta.text_params[slot]
             text_params.display_text = (
-                f"g{gid_label} | t{t.track_id} | {'o' if t.is_touching_edge else 'i'}{age_label}"
+                f"g{gid_label} | t{t.track_id} | {'o' if t.is_touching_edge else 'i'}{age_label}{dwell_label}"
             )
             text_params.x_offset = max(0, int(t.tlwh[0]))
             text_params.y_offset = max(0, int(t.tlwh[1]))
@@ -678,15 +798,41 @@ def main():
             sys.stderr.write("Failed to link source bin to stream muxer. Exiting.\n")
             return -1
 
-    pgie = Gst.ElementFactory.make("nvinfer", "primary-nvinference-engine")
-    sgie1 = Gst.ElementFactory.make("nvinfer", "secondary-nvinference-engine-1")
+    # Leaky queues (GST_QUEUE_LEAK_DOWNSTREAM=2): drop OLD buffers instead of
+    # blocking once a stage falls behind - the dual-tensor extraction + GTA/
+    # BoT-SORT work in reid_pad_buffer_probe runs synchronously on the
+    # streaming thread, and without this a slow tick backs up every upstream
+    # queue until the muxer/decoder stalls, which shows up as far worse
+    # "dropped frames" than a bounded leak here. Same fix
+    # DSMetroPerception_py/src/pipeline/main_multi.py already relies on.
+    def mk_queue(name):
+        q = Gst.ElementFactory.make("queue", name)
+        q.set_property("leaky", 2)
+        return q
 
-    queue1 = Gst.ElementFactory.make("queue", "queue1")
-    queue2 = Gst.ElementFactory.make("queue", "queue2")
-    queue3 = Gst.ElementFactory.make("queue", "queue3")
-    queue4 = Gst.ElementFactory.make("queue", "queue4")
-    queue5 = Gst.ElementFactory.make("queue", "queue5")
-    queue6 = Gst.ElementFactory.make("queue", "queue6")
+    pgie = Gst.ElementFactory.make("nvinfer", "primary-nvinference-engine")
+
+    # One nvinfer per entry in ACTIVE_SGIES (module-level testing knob) -
+    # each attaches its own NVDSINFER_TENSOR_OUTPUT_META to the same objects;
+    # reid_pad_buffer_probe reads all of them by gie-unique-id
+    # (GIE_STREAM_NAMES) into one detection's "reid_vectors" dict. See the
+    # module docstring in botsort/global_tracklet_association.py for why
+    # fusion happens at the log-likelihood level, not by concatenating them
+    # into one vector here.
+    sgie_elements = {
+        name: Gst.ElementFactory.make("nvinfer", SGIE_DEFS[name]["element"])
+        for name in ACTIVE_SGIES
+    }
+
+    queue1 = mk_queue("queue1")
+    queue2 = mk_queue("queue2")
+    queue3 = mk_queue("queue3")
+    # One queue between each pair of chained SGIEs (only meaningful when
+    # len(ACTIVE_SGIES) > 1 - a single-SGIE run just gets an empty list here).
+    sgie_gap_queues = [mk_queue(f"queue_sgie_gap_{i}") for i in range(len(ACTIVE_SGIES) - 1)]
+    queue4 = mk_queue("queue4")
+    queue5 = mk_queue("queue5")
+    queue6 = mk_queue("queue6")
 
     nvdslogger = Gst.ElementFactory.make("nvdslogger", "nvdslogger")
     tiler = Gst.ElementFactory.make("nvmultistreamtiler", "nvtiler")
@@ -696,8 +842,8 @@ def main():
     # The gallery-snapshot code reads pixels via pyds.get_nvds_buf_surface(),
     # which needs the buffer already in a CPU-mappable RGBA layout. Nothing
     # upstream converts color format otherwise (decoder output is typically
-    # NV12), so convert once, right after the muxer, before pgie/sgie1
-    # touch it. Same fix as ds_single_cam_tracking.py.
+    # NV12), so convert once, right after the muxer, before pgie/any SGIE
+    # touches it. Same fix as ds_single_cam_tracking.py.
     nvvidconv_rgba = Gst.ElementFactory.make("nvvideoconvert", "convertor-for-snapshot")
     caps_rgba = Gst.ElementFactory.make("capsfilter", "caps-rgba")
     caps_rgba.set_property(
@@ -705,7 +851,8 @@ def main():
     )
 
     is_aarch64 = platform.uname().machine == 'aarch64'
-    
+    is_live = any(uri.startswith("rtsp://") for uri in sources)
+
     if PERF_MODE or CHIRLA_EVAL_MODE:
         sink = Gst.ElementFactory.make("fakesink", "nvvideo-renderer")
     else:
@@ -714,7 +861,7 @@ def main():
         else:
             sink = Gst.ElementFactory.make("nveglglessink", "nvvideo-renderer")
 
-    if not (pgie and sgie1 and nvdslogger and tiler and nvvidconv and nvosd and sink
+    if not (pgie and all(sgie_elements.values()) and nvdslogger and tiler and nvvidconv and nvosd and sink
             and nvvidconv_rgba and caps_rgba):
         sys.stderr.write("One element could not be created. Exiting.\n")
         return -1
@@ -724,23 +871,28 @@ def main():
     if 'height' in streammux_config: streammux.set_property('height', streammux_config['height'])
     if 'batch-size' in streammux_config: streammux.set_property('batch-size', streammux_config['batch-size'])
     if 'batched-push-timeout' in streammux_config: streammux.set_property('batched-push-timeout', streammux_config['batched-push-timeout'])
+    streammux.set_property('live-source', is_live)
 
     pgie_config = config.get('primary-gie', {})
     pgie_config_path = pgie_config.get('config-file') or pgie_config.get('config-file-path')
     if pgie_config_path:
         pgie.set_property('config-file-path', pgie_config_path)
 
-    sgie1_config = config.get('secondary-gie-1', {})
-    sgie1_config_path = sgie1_config.get('config-file') or sgie1_config.get('config-file-path')
-    if sgie1_config_path:
-        sgie1.set_property('config-file-path', sgie1_config_path)
+    for name, el in sgie_elements.items():
+        sgie_cfg = config.get(SGIE_DEFS[name]["config_key"], {})
+        sgie_cfg_path = sgie_cfg.get('config-file') or sgie_cfg.get('config-file-path')
+        if sgie_cfg_path:
+            el.set_property('config-file-path', sgie_cfg_path)
 
     # Batch size override
     pgie_batch_size = pgie.get_property("batch-size")
     if pgie_batch_size != num_sources:
         sys.stderr.write(f"WARNING: Overriding infer-config batch-size ({pgie_batch_size}) with number of sources ({num_sources})\n")
         pgie.set_property("batch-size", num_sources)
-        sgie1.set_property("batch-size", num_sources)
+        for el in sgie_elements.values():
+            el.set_property("batch-size", num_sources)
+
+    sys.stdout.write(f"[sgie] active models: {ACTIVE_SGIES} (primary stream: {ACTIVE_SGIES[0]})\n")
 
     # tracker_config = config.get('tracker', {})
     # if 'll-config-file' in tracker_config: nvtracker.set_property('ll-config-file', tracker_config['ll-config-file'])
@@ -772,11 +924,32 @@ def main():
     streammux.set_property("nvbuf-memory-type", mem_type)
     nvvidconv_rgba.set_property("nvbuf-memory-type", mem_type)
 
+    sink_config = config.get('sink', {})
+    if 'qos' in sink_config:
+        sink.set_property('qos', bool(sink_config['qos']))
+    # File sources are non-live, so with sync off the pipeline decodes and
+    # renders as fast as the GPU allows (way past the file's native fps).
+    # sink.sync: true paces the sink to buffer timestamps / the pipeline
+    # clock instead, capping playback at the source's real frame rate.
+    # Defaults to off, matching DSMetroPerception_py/src/pipeline/
+    # main_multi.py's reference default.
+    sink.set_property('sync', bool(sink_config.get('sync', False)))
+
     bus = pipeline.get_bus()
     bus.add_signal_watch()
     bus.connect("message", bus_call, loop)
 
-    pipeline_flow = [nvvidconv_rgba, caps_rgba, queue1, pgie, queue2, queue3, sgie1, nvdslogger, tiler, queue4, nvvidconv, queue5, nvosd, queue6, sink]
+    # Main chain: streammux -> nvvidconv_rgba -> caps_rgba -> queue1 -> pgie
+    # -> queue2 -> queue3 -> [sgie for name in ACTIVE_SGIES, gap-queued
+    # between each] -> nvdslogger -> tiler -> queue4 -> nvvidconv -> queue5
+    # -> nvosd -> queue6 -> sink. Same start/end shape as
+    # DSMetroPerception_py/src/pipeline/main_multi.py's proven layout.
+    pipeline_flow = [nvvidconv_rgba, caps_rgba, queue1, pgie, queue2, queue3]
+    for i, name in enumerate(ACTIVE_SGIES):
+        pipeline_flow.append(sgie_elements[name])
+        if i < len(sgie_gap_queues):
+            pipeline_flow.append(sgie_gap_queues[i])
+    pipeline_flow += [nvdslogger, tiler, queue4, nvvidconv, queue5, nvosd, queue6, sink]
 
     for x in pipeline_flow: pipeline.add(x)
     streammux.link(pipeline_flow[0])
